@@ -1,0 +1,17 @@
+{
+  "experiment_name": "DailyStuff1",
+  "method_name": "tsplatter",
+  "checkpoint": "outputs/DailyStuff1/tsplatter/2025-07-19_143301/nerfstudio_models/step-000029999.ckpt",
+  "results": {
+    "psnr": 42.81257629394531,
+    "psnr_std": 9.453569412231445,
+    "ssim": 0.9841646552085876,
+    "ssim_std": 0.02050103433430195,
+    "lpips": 0.008554931730031967,
+    "lpips_std": 0.008703201077878475,
+    "num_rays_per_sec": 813000.4375,
+    "num_rays_per_sec_std": 380156.6875,
+    "fps": 2.6464858055114746,
+    "fps_std": 1.2374892234802246
+  }
+}

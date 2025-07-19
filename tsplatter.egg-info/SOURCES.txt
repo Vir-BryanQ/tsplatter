@@ -1,0 +1,15 @@
+README.md
+pyproject.toml
+tsplatter/__init__.py
+tsplatter/ts_config.py
+tsplatter/ts_datamanager.py
+tsplatter/ts_model.py
+tsplatter/ts_pipeline.py
+tsplatter.egg-info/PKG-INFO
+tsplatter.egg-info/SOURCES.txt
+tsplatter.egg-info/dependency_links.txt
+tsplatter.egg-info/entry_points.txt
+tsplatter.egg-info/requires.txt
+tsplatter.egg-info/top_level.txt
+tsplatter/data/thermalmap_dataparser.py
+tsplatter/data/ts_dataset.py

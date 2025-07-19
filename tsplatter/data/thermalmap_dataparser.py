@@ -19,6 +19,12 @@ from nerfstudio.data.dataparsers.colmap_dataparser import (
     ColmapDataParserConfig,
     DataparserOutputs,
 )
+from nerfstudio.data.utils.dataparsers_utils import (
+    get_train_eval_split_all,
+    get_train_eval_split_filename,
+    get_train_eval_split_fraction,
+    get_train_eval_split_interval,
+)
 from nerfstudio.data.scene_box import SceneBox
 from nerfstudio.plugins.registry_dataparser import DataParserSpecification
 from nerfstudio.process_data.colmap_utils import colmap_to_json
@@ -58,6 +64,56 @@ class ThermalMapDataParser(ColmapDataParser):
                 if key.startswith(prefix)
             }
             return gauss_params
+
+    def _get_image_indices(self, image_filenames, split):
+        has_split_files_spec = (
+            (self.config.data / "train_list.txt").exists()
+            or (self.config.data / "test_list.txt").exists()
+            or (self.config.data / "val_list.txt").exists()
+        )
+        if (self.config.data / f"{split}_list.txt").exists():
+            CONSOLE.log(f"Using {split}_list.txt to get indices for split {split}.")
+            with (self.config.data / f"{split}_list.txt").open("r", encoding="utf8") as f:
+                filenames = [line for line in f.read().splitlines() if line.strip()]
+            # Validate split first
+            split_filenames = set(self.config.data / self.config.images_path / x for x in filenames)
+
+            # 检测 split_filenames 中的文件名是否在 image_filenames 中存在
+            unmatched_filenames = split_filenames.difference(image_filenames)   # 找出在 split_filenames 中 存在，但在 image_filenames 中 不存在 的文件名，即集合差值A - B
+            if unmatched_filenames:
+                raise RuntimeError(
+                    f"Some filenames for split {split} were not found: {set(map(str, unmatched_filenames))}."
+                )
+
+            indices = [i for i, path in enumerate(image_filenames) if path in split_filenames]  # 使用图像image_filenames中的索引
+            CONSOLE.log(f"[yellow] Dataset is overriding {split}_indices to {indices}")
+            indices = np.array(indices, dtype=np.int32)
+        elif has_split_files_spec:
+            raise RuntimeError(f"The dataset's list of filenames for split {split} is missing.")
+        else:
+            # find train and eval indices based on the eval_mode specified
+            if self.config.eval_mode == "fraction":
+                i_train, i_eval = get_train_eval_split_fraction(image_filenames, self.config.train_split_fraction)
+            elif self.config.eval_mode == "filename":
+                i_train, i_eval = get_train_eval_split_filename(image_filenames)
+            elif self.config.eval_mode == "interval":
+                # interval
+                i_train, i_eval = get_train_eval_split_interval(image_filenames, self.config.eval_interval)
+            elif self.config.eval_mode == "all":
+                CONSOLE.log(
+                    "[yellow] Be careful with '--eval-mode=all'. If using camera optimization, the cameras may diverge in the current implementation, giving unpredictable results."
+                )
+                i_train, i_eval = get_train_eval_split_all(image_filenames)
+            else:
+                raise ValueError(f"Unknown eval mode {self.config.eval_mode}")
+
+            if split == "train":
+                indices = i_train
+            elif split in ["val", "test"]:
+                indices = i_eval
+            else:
+                raise ValueError(f"Unknown dataparser split {split}")
+        return indices
     
     def _generate_dataparser_outputs(self, split: str = "train", **kwargs):
         assert self.config.data.exists(), f"Data directory {self.config.data} does not exist."

@@ -3,7 +3,6 @@ from typing import Dict, Literal, Optional, Union
 
 import numpy as np
 import torch
-from dn_splatter.utils.camera_utils import euclidean_to_z_depth
 from PIL import Image
 
 from nerfstudio.data.dataparsers.base_dataparser import DataparserOutputs

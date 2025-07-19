@@ -38,8 +38,8 @@ from nerfstudio.pipelines.base_pipeline import (
 )
 from nerfstudio.utils import profiler
 from nerfstudio.utils.rich_utils import CONSOLE
-from ts_model import TSplatterModelConfig
-from ts_datamanager import TSplatterManagerConfig
+from tsplatter.ts_model import TSplatterModelConfig
+from tsplatter.ts_datamanager import TSplatterManagerConfig
 
 
 @dataclass
@@ -50,11 +50,12 @@ class TSplatterPipelineConfig(VanillaPipelineConfig):
     """specifies the datamanager config"""
     model: ModelConfig = field(default_factory=TSplatterModelConfig)
     """specifies the model config"""
+    
 
 class TSplatterPipeline(VanillaPipeline):
     def __init__(
         self,
-        config: DNSplatterPipelineConfig,
+        config: TSplatterPipelineConfig,
         device: str,
         test_mode: Literal["test", "val", "inference"] = "val",
         world_size: int = 1,

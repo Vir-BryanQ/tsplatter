@@ -4,14 +4,16 @@ import random
 from dataclasses import dataclass, field
 from typing import Dict, List, Literal, Optional, Tuple, Type, Union
 from concurrent.futures import ThreadPoolExecutor
+from rich.progress import track
 
 import torch
 import torch.nn.functional as F
 import torchvision.transforms.functional as TF
 from torch import Tensor
 from torch.nn import Parameter
-from torchmetrics.image import PeakSignalNoiseRatio, StructuralSimilarityIndexmeansure
+from torchmetrics.image import PeakSignalNoiseRatio, StructuralSimilarityIndexMeasure
 from torchmetrics.image.lpip import LearnedPerceptualImagePatchSimilarity
+from pytorch_msssim import SSIM
 
 try:
     from gsplat.rendering import rasterization
@@ -105,6 +107,8 @@ def assign_thermal_colors(means: torch.Tensor,
     means_np = means.cpu().numpy()
     world_np = world_points.cpu().numpy()
     thermal_np = thermal_images.cpu().numpy()
+
+    from sklearn.neighbors import NearestNeighbors
 
     # 建立最近邻模型
     nn = NearestNeighbors(n_neighbors=k, algorithm='auto', metric='euclidean')
@@ -207,18 +211,20 @@ class TSplatterModel(SplatfactoModel):
     # 在super().__init__()中调用了populate_modules()
     def populate_modules(self):
         dataset = self.train_dataset
+        self.xys_grad_norm = None
+        self.max_2Dsize = None
 
         BLOCK_WIDTH = 16
-        viewmats = get_viewmat(dataset.cameras.camera_to_worlds) 
+        viewmats = get_viewmat(dataset.cameras.camera_to_worlds).cuda() 
         Ks = dataset.cameras.get_intrinsics_matrices().cuda()
-        W, H = int(dataset.cameras.width.item()), int(dataset.cameras.height.item())
+        W, H = int(dataset.cameras.width[0, 0].item()), int(dataset.cameras.height[0, 0].item())
         sh_degree_to_use = self.config.sh_degree
-        means = dataset.metadata['means']
-        quats = dataset.metadata['quats']
-        scales = dataset.metadata['scales']
-        opacities = dataset.metadata['opacities']
-        features_dc = dataset.metadata['features_dc']
-        features_rest = dataset.metadata['features_rest']
+        means = dataset.metadata['means'].cuda()
+        quats = dataset.metadata['quats'].cuda()
+        scales = dataset.metadata['scales'].cuda()
+        opacities = dataset.metadata['opacities'].cuda()
+        features_dc = dataset.metadata['features_dc'].cuda()
+        features_rest = dataset.metadata['features_rest'].cuda()
         colors = torch.cat((features_dc[:, None, :], features_rest), dim=1)
 
         depth_im, alpha, _ = rasterization(
@@ -247,7 +253,7 @@ class TSplatterModel(SplatfactoModel):
 
         world_points = unproject_depth_to_world(depth_im=depth_im, Ks=Ks, viewmats=viewmats)    # [C,W,H,3]
 
-        def _load_all_thermal(self, idx: int) -> torch.Tensor:
+        def _load_all_thermal(idx: int) -> torch.Tensor:
             data = dataset.get_data(idx, image_type="float32")  # 默认是 float32
             camera = dataset.cameras[idx].reshape(())
             # 如果相机的宽度和高度与图像的尺寸不匹配，则抛出异常
@@ -269,7 +275,7 @@ class TSplatterModel(SplatfactoModel):
                     total=len(dataset),  
                 )
             )
-        thermal_images = torch.stack(thermal_images, dim=0).permute(0, 2, 1, 3) # [C,W,H,1]
+        thermal_images = torch.stack(thermal_images, dim=0).permute(0, 2, 1, 3).cuda() # [C,W,H,1]
 
         assert thermal_images.shape[:3] == world_points.shape[:3], (
             f'The shape of world_points {world_points.shape} does not match the loaded thermal_images {thermal_images.shape}'

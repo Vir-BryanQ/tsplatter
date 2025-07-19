@@ -1,0 +1,5 @@
+[nerfstudio.dataparser_configs]
+thermalmap = tsplatter:ThermalMapDataParserSpecification
+
+[nerfstudio.method_configs]
+tsplatter = tsplatter.ts_config:tsplatter
