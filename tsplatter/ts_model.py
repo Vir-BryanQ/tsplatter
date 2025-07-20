@@ -522,7 +522,7 @@ class TSplatterModel(SplatfactoModel):
         if normals_im is not None:
             normals_im = normals_im.squeeze(0)
 
-        sufface_normal = None
+        surface_normal = None
         if self.config.use_normal_loss:
             surface_normal = normal_from_depth_image(
                 depths=depth_im.detach(),
