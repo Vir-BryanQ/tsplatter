@@ -5,6 +5,8 @@ from dataclasses import dataclass, field
 from typing import Dict, List, Literal, Optional, Tuple, Type, Union
 from concurrent.futures import ThreadPoolExecutor
 from rich.progress import track
+from pathlib import Path
+import torchvision.utils as vutils
 
 import torch
 import torch.nn.functional as F
@@ -41,6 +43,8 @@ from nerfstudio.models.splatfacto import (
 from nerfstudio.utils.colors import get_color
 from nerfstudio.utils.rich_utils import CONSOLE
 from tsplatter.data.ts_dataset import TSDataset
+from tsplatter.utils.normal_utils import normal_from_depth_image
+from tsplatter.losses import NormalLoss, NormalLossType
 
 def unproject_depth_to_world(depth_im, Ks, viewmats):
     C, W, H, _ = depth_im.shape
@@ -128,6 +132,13 @@ def assign_thermal_colors(means: torch.Tensor,
 def num_sh_bases1(degree: int):
     return degree + 1
 
+def get_scale_loss(scales):
+    """Scale loss"""
+    # loss to minimise gaussian scale corresponding to normal direction
+    scale_loss = torch.min(torch.exp(scales), dim=1, keepdim=True)[0].mean()
+    return scale_loss
+
+
 @dataclass
 class TSplatterModelConfig(SplatfactoModelConfig):
     _target: Type = field(default_factory=lambda: TSplatterModel)
@@ -173,7 +184,7 @@ class TSplatterModelConfig(SplatfactoModelConfig):
     """weight of ssim loss"""
     stop_split_at: int = 15000
     """stop splitting at this step"""
-    sh_degree: int = 3
+    sh_degree: int = 4
     """maximum degree of spherical harmonics to use"""
     use_scale_regularization: bool = False
     """If enabled, a scale regularization introduced in PhysGauss (https://xpandora.github.io/PhysGaussian/) is used for reducing huge spikey gaussians."""
@@ -181,7 +192,7 @@ class TSplatterModelConfig(SplatfactoModelConfig):
     """threshold of ratio of gaussian max to min scale before applying regularization
     loss from the PhysGaussian paper
     """
-    output_depth_during_training: bool = False
+    output_depth_during_training: bool = True
     """If True, output depth during training. Otherwise, only output depth during evaluation."""
     rasterize_mode: Literal["classic", "antialiased"] = "classic"
     """
@@ -195,6 +206,16 @@ class TSplatterModelConfig(SplatfactoModelConfig):
     """
     camera_optimizer: CameraOptimizerConfig = field(default_factory=lambda: CameraOptimizerConfig(mode="off"))
     """Config of the camera optimizer to use"""
+    use_normal_loss: bool = False
+    """Enables normal loss('s)"""
+    use_normal_tv_loss: bool = False
+    """Use TV loss on predicted normals."""
+    smooth_loss_lambda: float = 0.1
+    """Regularizer for smooth loss"""
+    normal_lambda: float = 0.1
+    """Regularizer for normal loss"""
+    use_scale_loss: bool = False
+    disable_refinement: bool = True
 
 class TSplatterModel(SplatfactoModel):
     config: TSplatterModelConfig
@@ -218,7 +239,6 @@ class TSplatterModel(SplatfactoModel):
         viewmats = get_viewmat(dataset.cameras.camera_to_worlds).cuda() 
         Ks = dataset.cameras.get_intrinsics_matrices().cuda()
         W, H = int(dataset.cameras.width[0, 0].item()), int(dataset.cameras.height[0, 0].item())
-        sh_degree_to_use = self.config.sh_degree
         means = dataset.metadata['means'].cuda()
         quats = dataset.metadata['quats'].cuda()
         scales = dataset.metadata['scales'].cuda()
@@ -226,6 +246,7 @@ class TSplatterModel(SplatfactoModel):
         features_dc = dataset.metadata['features_dc'].cuda()
         features_rest = dataset.metadata['features_rest'].cuda()
         colors = torch.cat((features_dc[:, None, :], features_rest), dim=1)
+        sh_degree_to_use = int((colors.shape[-2] ** 0.5) - 1)
 
         depth_im, alpha, _ = rasterization(
             means=means,
@@ -323,6 +344,11 @@ class TSplatterModel(SplatfactoModel):
         self.lpips = LearnedPerceptualImagePatchSimilarity(normalize=True)
         self.step = 0
 
+        if self.config.use_normal_loss:
+            self.normal_loss = NormalLoss(NormalLossType.L1)
+        if self.config.use_normal_tv_loss:
+            self.normal_tv_loss = NormalLoss(NormalLossType.Smooth)
+
         self.crop_box: Optional[OrientedBox] = None
         if self.config.background_color == "random":
             # 默认是随机背景色
@@ -340,7 +366,7 @@ class TSplatterModel(SplatfactoModel):
     @property
     def thermal_features_rest(self):
         return self.gauss_params["thermal_features_rest"]
-
+    
     def get_gaussian_param_groups(self) -> Dict[str, List[Parameter]]:
         # Here we explicitly use the means, scales as parameters so that the user can override this function and
         # specify more if they want to add more optimizable params to gaussians.
@@ -372,6 +398,8 @@ class TSplatterModel(SplatfactoModel):
         Returns:
             Outputs of model. (ie. rendered colors)
         """
+        # return super().get_outputs(camera=camera)
+
         if not isinstance(camera, Cameras):
             print("Called get_outputs with not a camera")
             return {}
@@ -425,9 +453,6 @@ class TSplatterModel(SplatfactoModel):
         W, H = int(camera.width.item()), int(camera.height.item())
         self.last_size = (H, W)
 
-        # 获取相机内参矩阵等信息后，重新恢复原始的相机输出分辨率
-        camera.rescale_output_resolution(camera_scale_fac)  # type: ignore
-
         # apply the compensation of screen space blurring to gaussians
         if self.config.rasterize_mode not in ["antialiased", "classic"]:
             # 默认是 "classic" 模式
@@ -466,6 +491,7 @@ class TSplatterModel(SplatfactoModel):
             sparse_grad=False,
             absgrad=True,
             rasterize_mode=self.config.rasterize_mode,  # 默认是 "classic" 模式
+            render_normal_map=self.config.use_normal_loss or self.config.use_normal_tv_loss
             # set some threshold to disregrad small gaussians for faster rendering.
             # radius_clip=3.0,
         )
@@ -478,6 +504,7 @@ class TSplatterModel(SplatfactoModel):
         background = self._get_background_color()
         # 把连续的若干个高斯的 αT 累加起来可以得到这一组高斯的 总alpha，可以继续用于后续的alpha blending中
         rgb = render[:, ..., :3] + (1 - alpha) * background
+        # 在这里将rgb值限制到[0.0,1.0]
         rgb = torch.clamp(rgb, 0.0, 1.0)
         # 这里的rgb指的是渲染出来的热红外伪彩色图像
 
@@ -490,12 +517,39 @@ class TSplatterModel(SplatfactoModel):
             depth_im = torch.where(alpha > 0, depth_im, depth_im.detach().max()).squeeze(0)
         else:
             depth_im = None
+        
+        normals_im = info["normals_im"]
+        if normals_im is not None:
+            normals_im = normals_im.squeeze(0)
+
+        sufface_normal = None
+        if self.config.use_normal_loss:
+            surface_normal = normal_from_depth_image(
+                depths=depth_im.detach(),
+                fx=camera.fx.item(),
+                fy=camera.fy.item(),
+                cx=camera.cx.item(),
+                cy=camera.cy.item(),
+                img_size=(W, H),
+                c2w=torch.eye(4, dtype=torch.float, device=depth_im.device),
+                device=self.device,
+                smooth=False,
+            )
+            surface_normal = surface_normal @ torch.diag(
+                torch.tensor([1, -1, -1], device=depth_im.device, dtype=depth_im.dtype)
+            )
+            surface_normal = (1 + surface_normal) / 2
+
+        # 获取相机内参等信息后，重新恢复原始的相机输出分辨率
+        camera.rescale_output_resolution(camera_scale_fac)  # type: ignore
 
         if background.shape[0] == 3 and not self.training:
             background = background.expand(H, W, 3)
 
         return {
             "rgb": rgb.squeeze(0),  # type: ignore
+            "normal": normals_im,
+            "surface_normal": surface_normal,
             "depth": depth_im,  # type: ignore
             "accumulation": alpha.squeeze(0),  # type: ignore
             "background": background,  # type: ignore
@@ -541,9 +595,22 @@ class TSplatterModel(SplatfactoModel):
         else:
             # 默认 False
             scale_reg = torch.tensor(0.0).to(self.device)
+        
+        # 使高斯disc-like
+        scale_loss = 0.0
+        if self.config.use_scale_loss:
+            scale_loss = get_scale_loss(self.scales)
+
+        total_normal_loss = 0.0
+        gt_normal = outputs["surface_normal"]
+        pred_normal = outputs["normal"]
+        if self.config.use_normal_loss:
+            total_normal_loss += self.normal_loss(pred_normal, gt_normal) * self.config.normal_lambda
+        if self.config.use_normal_tv_loss:
+            total_normal_loss += self.normal_tv_loss(pred_normal) * self.config.smooth_loss_lambda
 
         loss_dict = {
-            "main_loss": (1 - self.config.ssim_lambda) * Ll1 + self.config.ssim_lambda * simloss,
+            "main_loss": (1 - self.config.ssim_lambda) * Ll1 + self.config.ssim_lambda * simloss + scale_loss + total_normal_loss,
             "scale_reg": scale_reg, # 默认是0
         }
 
@@ -609,3 +676,117 @@ class TSplatterModel(SplatfactoModel):
                 # 其他参数直接复制
                 out[name] = param[split_mask].repeat(samps, 1)
         return out
+
+    def refinement_after(self, optimizers: Optimizers, step):
+        if self.config.disable_refinement:
+            return 
+
+        assert step == self.step
+        # self.config.warmup_length 500
+        if self.step <= self.config.warmup_length:
+            # 训练开始阶段不进行refinement
+            return
+        with torch.no_grad():
+            # Offset all the opacity reset logic by refine_every so that we don't
+            # save checkpoints right when the opacity is reset (saves every 2k)
+            # then cull
+            # only split/cull if we've seen every image since opacity reset
+
+            # self.config.refine_every 默认是100
+            # self.config.reset_alpha_every 默认是30
+            reset_interval = self.config.reset_alpha_every * self.config.refine_every
+            do_densification = (
+                # self.config.stop_split_at 默认是15000
+                self.step < self.config.stop_split_at
+                # 等数据完整喂完一轮后再进行 densification
+                and self.step % reset_interval > self.num_train_data + self.config.refine_every
+            )
+            if do_densification:
+                # then we densify
+                assert self.xys_grad_norm is not None and self.vis_counts is not None and self.max_2Dsize is not None
+
+                #对于高位置梯度的所有高斯，高于densify_size_thresh的高斯进行split，小于等于densify_size_thresh的高斯进行duplicate
+                avg_grad_norm = (self.xys_grad_norm / self.vis_counts) * 0.5 * max(self.last_size[0], self.last_size[1])
+                # self.config.densify_grad_thresh默认是0.0008
+                high_grads = (avg_grad_norm > self.config.densify_grad_thresh).squeeze()
+                # self.config.densify_size_thresh默认是0.01
+                splits = (self.scales.exp().max(dim=-1).values > self.config.densify_size_thresh).squeeze()
+                # self.config.stop_screen_size_at默认是4000
+                if self.step < self.config.stop_screen_size_at:
+                    # self.config.split_screen_size默认是0.05
+                    splits |= (self.max_2Dsize > self.config.split_screen_size).squeeze()
+                # 对高位置梯度且size比较大的高斯进行split
+                splits &= high_grads
+                nsamps = self.config.n_split_samples    # 2
+                split_params = self.split_gaussians(splits, nsamps)
+
+                # self.config.densify_size_thresh 0.01
+                dups = (self.scales.exp().max(dim=-1).values <= self.config.densify_size_thresh).squeeze()
+                # 对高位置梯度且size比较小的高斯进行duplicate
+                dups &= high_grads
+                dup_params = self.dup_gaussians(dups)
+                for name, param in self.gauss_params.items():
+                    self.gauss_params[name] = torch.nn.Parameter(
+                        torch.cat([param.detach(), split_params[name], dup_params[name]], dim=0)
+                    )
+                # append zeros to the max_2Dsize tensor
+                self.max_2Dsize = torch.cat(
+                    [
+                        self.max_2Dsize,
+                        torch.zeros_like(split_params["scales"][:, 0]),
+                        torch.zeros_like(dup_params["scales"][:, 0]),
+                    ],
+                    dim=0,
+                )
+
+                split_idcs = torch.where(splits)[0]
+                self.dup_in_all_optim(optimizers, split_idcs, nsamps)
+
+                dup_idcs = torch.where(dups)[0]
+                self.dup_in_all_optim(optimizers, dup_idcs, 1)
+
+                # After a guassian is split into two new gaussians, the original one should also be pruned.
+                splits_mask = torch.cat(
+                    (
+                        splits,
+                        torch.zeros(
+                            nsamps * splits.sum() + dups.sum(),
+                            device=self.device,
+                            dtype=torch.bool,
+                        ),
+                    )
+                )
+
+                deleted_mask = self.cull_gaussians(splits_mask)
+            elif self.step >= self.config.stop_split_at and self.config.continue_cull_post_densification:
+                # self.config.continue_cull_post_densification默认是True
+                deleted_mask = self.cull_gaussians()
+            else:
+                # if we donot allow culling post refinement, no more gaussians will be pruned.
+                deleted_mask = None
+
+            if deleted_mask is not None:
+                self.remove_from_all_optim(optimizers, deleted_mask)
+
+            if self.step < self.config.stop_split_at and self.step % reset_interval == self.config.refine_every:
+                # Reset value is set to be twice of the cull_alpha_thresh
+                # cull_alpha_thresh: float = 0.1
+                reset_value = self.config.cull_alpha_thresh * 2.0
+                # self.opacities.data 是对 self.opacities 张量的 原始数据 的引用
+                # 通过 data 属性直接访问或修改张量的原始数据，而不触发梯度计算
+                # 也可使用 torch.no_grad()
+                self.opacities.data = torch.clamp(
+                    self.opacities.data,
+                    # 先构建一个tensor是为了使用torch.logit,随后使用item变回普通标量
+                    max=torch.logit(torch.tensor(reset_value, device=self.device)).item(),
+                )
+                # reset the exp of optimizer
+                optim = optimizers.optimizers["opacities"]
+                param = optim.param_groups[0]["params"][0]
+                param_state = optim.state[param]
+                param_state["exp_avg"] = torch.zeros_like(param_state["exp_avg"])
+                param_state["exp_avg_sq"] = torch.zeros_like(param_state["exp_avg_sq"])
+
+            self.xys_grad_norm = None
+            self.vis_counts = None
+            self.max_2Dsize = None

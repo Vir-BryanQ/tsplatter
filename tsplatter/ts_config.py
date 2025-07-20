@@ -35,14 +35,6 @@ tsplatter = MethodSpecification(
                     lr_final=1.6e-6, max_steps=30000
                 ),
             },
-            "thermal_features_dc": {
-                "optimizer": AdamOptimizerConfig(lr=0.0025, eps=1e-15),
-                "scheduler": None,
-            },
-            "thermal_features_rest": {
-                "optimizer": AdamOptimizerConfig(lr=0.0025 / 20, eps=1e-15),
-                "scheduler": None,
-            },
             "opacities": {
                 "optimizer": AdamOptimizerConfig(lr=0.05, eps=1e-15),
                 "scheduler": None,
@@ -53,6 +45,33 @@ tsplatter = MethodSpecification(
             },
             "quats": {
                 "optimizer": AdamOptimizerConfig(lr=0.001, eps=1e-15),
+                "scheduler": None,
+            },
+            # "means": {
+            #     "optimizer": AdamOptimizerConfig(lr=1e-20, eps=1e-15),
+            #     "scheduler": ExponentialDecaySchedulerConfig(
+            #         lr_final=1e-20, max_steps=30000
+            #     ),
+            # },
+            # "opacities": {
+            #     "optimizer": AdamOptimizerConfig(lr=1e-20, eps=1e-15),
+            #     "scheduler": None,
+            # },
+            # "scales": {
+            #     "optimizer": AdamOptimizerConfig(lr=1e-20, eps=1e-15),
+            #     "scheduler": None,
+            # },
+            # "quats": {
+            #     "optimizer": AdamOptimizerConfig(lr=1e-20, eps=1e-15),
+            #     "scheduler": None,
+            # },
+
+            "thermal_features_dc": {
+                "optimizer": AdamOptimizerConfig(lr=0.0025, eps=1e-15),
+                "scheduler": None,
+            },
+            "thermal_features_rest": {
+                "optimizer": AdamOptimizerConfig(lr=0.0025 / 20, eps=1e-15),
                 "scheduler": None,
             },
             "camera_opt": {
