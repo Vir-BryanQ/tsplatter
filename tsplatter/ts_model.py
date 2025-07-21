@@ -42,6 +42,7 @@ from nerfstudio.models.splatfacto import (
 )
 from nerfstudio.utils.colors import get_color
 from nerfstudio.utils.rich_utils import CONSOLE
+from nerfstudio.utils import colormaps
 from tsplatter.data.ts_dataset import TSDataset
 from tsplatter.utils.normal_utils import normal_from_depth_image
 from tsplatter.losses import NormalLoss, NormalLossType
@@ -206,6 +207,8 @@ class TSplatterModelConfig(SplatfactoModelConfig):
     """
     camera_optimizer: CameraOptimizerConfig = field(default_factory=lambda: CameraOptimizerConfig(mode="off"))
     """Config of the camera optimizer to use"""
+    predict_normals: bool = False
+    """Whether to extract and render normals or skip this"""
     use_normal_loss: bool = False
     """Enables normal loss('s)"""
     use_normal_tv_loss: bool = False
@@ -215,7 +218,7 @@ class TSplatterModelConfig(SplatfactoModelConfig):
     normal_lambda: float = 0.1
     """Regularizer for normal loss"""
     use_scale_loss: bool = False
-    disable_refinement: bool = True
+    disable_refinement: bool = False
 
 class TSplatterModel(SplatfactoModel):
     config: TSplatterModelConfig
@@ -463,6 +466,8 @@ class TSplatterModel(SplatfactoModel):
             render_mode = "Thermal+ED"
         else:
             render_mode = "Thermal"
+        
+        render_normal_map = (self.config.predict_normals or not self.training)
 
         if self.config.sh_degree > 0:
             # sh_degree_interval: int = 1000
@@ -491,7 +496,7 @@ class TSplatterModel(SplatfactoModel):
             sparse_grad=False,
             absgrad=True,
             rasterize_mode=self.config.rasterize_mode,  # 默认是 "classic" 模式
-            render_normal_map=self.config.use_normal_loss or self.config.use_normal_tv_loss
+            render_normal_map=render_normal_map
             # set some threshold to disregrad small gaussians for faster rendering.
             # radius_clip=3.0,
         )
@@ -518,12 +523,17 @@ class TSplatterModel(SplatfactoModel):
         else:
             depth_im = None
         
-        normals_im = info["normals_im"]
-        if normals_im is not None:
+        normals_im = None
+        if render_normal_map:
+            normals_im = render[:, ..., 4:7]
             normals_im = normals_im.squeeze(0)
+            # gsplat的相机坐标系约定(OpenCV) -> OpenGL的相机坐标系约定
+            normals_im = normals_im * torch.tensor([[[1, -1, -1]]], device=normals_im.device, dtype=normals_im.dtype)
+            normals_im = (normals_im + 1) / 2   # 线性映射
+        
 
         surface_normal = None
-        if self.config.use_normal_loss:
+        if self.config.use_normal_loss or not self.training:
             surface_normal = normal_from_depth_image(
                 depths=depth_im.detach(),
                 fx=camera.fx.item(),
@@ -768,25 +778,64 @@ class TSplatterModel(SplatfactoModel):
             if deleted_mask is not None:
                 self.remove_from_all_optim(optimizers, deleted_mask)
 
-            if self.step < self.config.stop_split_at and self.step % reset_interval == self.config.refine_every:
-                # Reset value is set to be twice of the cull_alpha_thresh
-                # cull_alpha_thresh: float = 0.1
-                reset_value = self.config.cull_alpha_thresh * 2.0
-                # self.opacities.data 是对 self.opacities 张量的 原始数据 的引用
-                # 通过 data 属性直接访问或修改张量的原始数据，而不触发梯度计算
-                # 也可使用 torch.no_grad()
-                self.opacities.data = torch.clamp(
-                    self.opacities.data,
-                    # 先构建一个tensor是为了使用torch.logit,随后使用item变回普通标量
-                    max=torch.logit(torch.tensor(reset_value, device=self.device)).item(),
-                )
-                # reset the exp of optimizer
-                optim = optimizers.optimizers["opacities"]
-                param = optim.param_groups[0]["params"][0]
-                param_state = optim.state[param]
-                param_state["exp_avg"] = torch.zeros_like(param_state["exp_avg"])
-                param_state["exp_avg_sq"] = torch.zeros_like(param_state["exp_avg_sq"])
+            # if self.step < self.config.stop_split_at and self.step % reset_interval == self.config.refine_every:
+            #     # Reset value is set to be twice of the cull_alpha_thresh
+            #     # cull_alpha_thresh: float = 0.1
+            #     reset_value = self.config.cull_alpha_thresh * 2.0
+            #     # self.opacities.data 是对 self.opacities 张量的 原始数据 的引用
+            #     # 通过 data 属性直接访问或修改张量的原始数据，而不触发梯度计算
+            #     # 也可使用 torch.no_grad()
+            #     self.opacities.data = torch.clamp(
+            #         self.opacities.data,
+            #         # 先构建一个tensor是为了使用torch.logit,随后使用item变回普通标量
+            #         max=torch.logit(torch.tensor(reset_value, device=self.device)).item(),
+            #     )
+            #     # reset the exp of optimizer
+            #     optim = optimizers.optimizers["opacities"]
+            #     param = optim.param_groups[0]["params"][0]
+            #     param_state = optim.state[param]
+            #     param_state["exp_avg"] = torch.zeros_like(param_state["exp_avg"])
+            #     param_state["exp_avg_sq"] = torch.zeros_like(param_state["exp_avg_sq"])
 
             self.xys_grad_norm = None
             self.vis_counts = None
             self.max_2Dsize = None
+
+    def get_image_metrics_and_images(
+        self, outputs: Dict[str, torch.Tensor], batch: Dict[str, torch.Tensor]
+    ) -> Tuple[Dict[str, float], Dict[str, torch.Tensor]]:
+        """Writes the test image outputs.
+
+        Args:
+            image_idx: Index of the image.
+            step: Current step.
+            batch: Batch of data.
+            outputs: Outputs of the model.
+
+        Returns:
+            A dictionary of metrics.
+        """
+        gt_rgb = self.composite_with_background(self.get_gt_img(batch["image"]), outputs["background"])
+        predicted_rgb = outputs["rgb"]
+        predicted_normal = outputs["normal"]
+        surface_normal = outputs["surface_normal"]
+        predicted_depth = outputs["depth"]
+        depth_color = colormaps.apply_depth_colormap(predicted_depth)
+
+        combined_rgb = torch.cat([gt_rgb, predicted_rgb, depth_color, surface_normal, predicted_normal], dim=1)
+
+        # Switch images from [H, W, C] to [1, C, H, W] for metrics computations
+        gt_rgb = torch.moveaxis(gt_rgb, -1, 0)[None, ...]
+        predicted_rgb = torch.moveaxis(predicted_rgb, -1, 0)[None, ...]
+
+        psnr = self.psnr(gt_rgb, predicted_rgb)
+        ssim = self.ssim(gt_rgb, predicted_rgb)
+        lpips = self.lpips(gt_rgb, predicted_rgb)
+
+        # all of these metrics will be logged as scalars
+        metrics_dict = {"psnr": float(psnr.item()), "ssim": float(ssim)}  # type: ignore
+        metrics_dict["lpips"] = float(lpips)
+
+        images_dict = {"img": combined_rgb}
+
+        return metrics_dict, images_dict

@@ -93,3 +93,5 @@ class TSplatterPipeline(VanillaPipeline):
                 DDP(self._model, device_ids=[local_rank], find_unused_parameters=True),
             )
             dist.barrier(device_ids=[local_rank])
+    
+    
