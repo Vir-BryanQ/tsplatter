@@ -144,14 +144,17 @@ def get_scale_loss(scales):
 class TSplatterModelConfig(SplatfactoModelConfig):
     _target: Type = field(default_factory=lambda: TSplatterModel)
     warmup_length: int = 500
+    # warmup_length: int = 0
     """period of steps where refinement is turned off"""
     refine_every: int = 100
+    # refine_every: int = 5
     """period of steps where gaussians are culled and densified"""
-    resolution_schedule: int = 3000
+    # resolution_schedule: int = 3000
+    resolution_schedule: int = 150
     """training starts at 1/d resolution, every n steps this is doubled"""
     background_color: Literal["random", "black", "white"] = "random"
     """Whether to randomize the background color."""
-    num_downscales: int = 2
+    num_downscales: int = 0
     """at the beginning, resolution is 1/2^d, where d is this number"""
     cull_alpha_thresh: float = 0.1
     """threshold of opacity for culling gaussians. One can set it to a lower value (e.g. 0.005) for higher quality."""
@@ -159,7 +162,8 @@ class TSplatterModelConfig(SplatfactoModelConfig):
     """threshold of scale for culling huge gaussians"""
     continue_cull_post_densification: bool = True
     """If True, continue to cull gaussians post refinement"""
-    reset_alpha_every: int = 30
+    # reset_alpha_every: int = 30
+    reset_alpha_every: int = 2
     """Every this many refinement steps, reset the alpha"""
     densify_grad_thresh: float = 0.0008
     """threshold of positional gradient norm for densifying gaussians"""
@@ -167,7 +171,8 @@ class TSplatterModelConfig(SplatfactoModelConfig):
     """below this size, gaussians are *duplicated*, otherwise split"""
     n_split_samples: int = 2
     """number of samples to split gaussians into"""
-    sh_degree_interval: int = 1000
+    # sh_degree_interval: int = 1000
+    sh_degree_interval: int = 1
     """every n intervals turn on another sh degree"""
     cull_screen_size: float = 0.15
     """if a gaussian is more than this percent of screen space, cull it"""
@@ -184,8 +189,9 @@ class TSplatterModelConfig(SplatfactoModelConfig):
     ssim_lambda: float = 0.2
     """weight of ssim loss"""
     stop_split_at: int = 15000
+    # stop_split_at: int = 375
     """stop splitting at this step"""
-    sh_degree: int = 4
+    sh_degree: int = 0
     """maximum degree of spherical harmonics to use"""
     use_scale_regularization: bool = False
     """If enabled, a scale regularization introduced in PhysGauss (https://xpandora.github.io/PhysGaussian/) is used for reducing huge spikey gaussians."""
@@ -218,7 +224,9 @@ class TSplatterModelConfig(SplatfactoModelConfig):
     normal_lambda: float = 0.1
     """Regularizer for normal loss"""
     use_scale_loss: bool = False
+    use_rgb_loss: bool = True
     disable_refinement: bool = False
+    use_vanilla_sh: bool = False
 
 class TSplatterModel(SplatfactoModel):
     config: TSplatterModelConfig
@@ -309,12 +317,20 @@ class TSplatterModel(SplatfactoModel):
         world_points = world_points.reshape(-1, 3)
         thermal_images = thermal_images.reshape(-1, 3)
 
-        dim_sh = num_sh_bases1(self.config.sh_degree)
+        if self.config.use_vanilla_sh:
+            dim_sh = num_sh_bases(self.config.sh_degree)
+        else:
+            dim_sh = num_sh_bases1(self.config.sh_degree)
 
         thermal_colors = assign_thermal_colors(means=means, thermal_images=thermal_images, world_points=world_points, k=3)
 
         shs = torch.zeros((means.shape[0], dim_sh, 3)).float().cuda()
-        shs[:, 0, :3] = RGB2SH(thermal_colors)
+        if self.config.sh_degree > 0:
+            shs[:, 0, :3] = RGB2SH(thermal_colors)
+        else:
+            CONSOLE.log("use color only optimization with sigmoid activation")
+            shs[:, 0, :3] = torch.logit(thermal_colors, eps=1e-10)
+
         thermal_features_dc = torch.nn.Parameter(shs[:, 0, :]) 
         thermal_features_rest = torch.nn.Parameter(shs[:, 1:, :])
 
@@ -434,6 +450,8 @@ class TSplatterModel(SplatfactoModel):
             thermal_features_rest_crop = self.thermal_features_rest[crop_ids]
             scales_crop = self.scales[crop_ids]
             quats_crop = self.quats[crop_ids]
+            features_dc_crop = self.features_dc[crop_ids]
+            features_rest_crop = self.features_rest[crop_ids]
         else:
             # 训练时不裁剪
             opacities_crop = self.opacities
@@ -442,8 +460,11 @@ class TSplatterModel(SplatfactoModel):
             thermal_features_rest_crop = self.thermal_features_rest
             scales_crop = self.scales
             quats_crop = self.quats
+            features_dc_crop = self.features_dc
+            features_rest_crop = self.features_rest
 
         colors_crop = torch.cat((thermal_features_dc_crop[:, None, :], thermal_features_rest_crop), dim=1)
+        rgb_colors_crop = torch.cat((features_dc_crop[:, None, :], features_rest_crop), dim=1)
 
         BLOCK_WIDTH = 16  # this controls the tile size of rasterization, 16 is a good default
 
@@ -472,9 +493,10 @@ class TSplatterModel(SplatfactoModel):
         if self.config.sh_degree > 0:
             # sh_degree_interval: int = 1000
             # 每隔sh_degree_interval个step就使sh_degree加一
-            sh_degree_to_use = min(self.step // self.config.sh_degree_interval, self.config.sh_degree)
+            # sh_degree_to_use = min(self.step // self.config.sh_degree_interval, self.config.sh_degree)
+            sh_degree_to_use = self.config.sh_degree
         else:
-            colors_crop = torch.sigmoid(colors_crop)
+            colors_crop = torch.sigmoid(colors_crop).squeeze(-2)
             sh_degree_to_use = None
 
         render, alpha, info = rasterization_thermal(
@@ -496,7 +518,8 @@ class TSplatterModel(SplatfactoModel):
             sparse_grad=False,
             absgrad=True,
             rasterize_mode=self.config.rasterize_mode,  # 默认是 "classic" 模式
-            render_normal_map=render_normal_map
+            render_normal_map=render_normal_map,
+            vanilla_sh=self.config.use_vanilla_sh
             # set some threshold to disregrad small gaussians for faster rendering.
             # radius_clip=3.0,
         )
@@ -549,7 +572,36 @@ class TSplatterModel(SplatfactoModel):
                 torch.tensor([1, -1, -1], device=depth_im.device, dtype=depth_im.dtype)
             )
             surface_normal = (1 + surface_normal) / 2
+        
+        rgb0 = None
+        if self.config.use_rgb_loss or not self.training:
+            sh_degree_to_use = int(rgb_colors_crop.shape[-2] ** 0.5 - 1)
+            render, alpha, _ = rasterization(
+            means=means_crop,
+            quats=quats_crop / quats_crop.norm(dim=-1, keepdim=True),   # 实际上不归一化也是可以的
+            scales=torch.exp(scales_crop),
+            opacities=torch.sigmoid(opacities_crop).squeeze(-1),
+            colors=rgb_colors_crop,
+            viewmats=viewmat,  # [1, 4, 4]
+            Ks=K,  # [1, 3, 3]
+            width=W,
+            height=H,
+            tile_size=BLOCK_WIDTH,  
+            packed=False,
+            near_plane=0.01,
+            far_plane=1e10,
+            render_mode="RGB",
+            sh_degree=sh_degree_to_use,
+            sparse_grad=False,
+            absgrad=True,
+            rasterize_mode=self.config.rasterize_mode,  # 默认是 "classic" 模式
+        )
+            alpha = alpha[:, ...]
+            rgb0 = render[:, ..., :3] + (1 - alpha) * background
+            rgb0 = torch.clamp(rgb0, 0.0, 1.0)
+            rgb0 = rgb0.squeeze(0)
 
+        
         # 获取相机内参等信息后，重新恢复原始的相机输出分辨率
         camera.rescale_output_resolution(camera_scale_fac)  # type: ignore
 
@@ -558,6 +610,7 @@ class TSplatterModel(SplatfactoModel):
 
         return {
             "rgb": rgb.squeeze(0),  # type: ignore
+            "rgb0": rgb0,
             "normal": normals_im,
             "surface_normal": surface_normal,
             "depth": depth_im,  # type: ignore
@@ -592,6 +645,8 @@ class TSplatterModel(SplatfactoModel):
 
         Ll1 = torch.abs(gt_img - pred_img).mean()
         simloss = 1 - self.ssim(gt_img.permute(2, 0, 1)[None, ...], pred_img.permute(2, 0, 1)[None, ...])
+        thermal_loss = (1 - self.config.ssim_lambda) * Ll1 + self.config.ssim_lambda * simloss
+
         if self.config.use_scale_regularization and self.step % 10 == 0:
             scale_exp = torch.exp(self.scales)
             scale_reg = (
@@ -619,8 +674,23 @@ class TSplatterModel(SplatfactoModel):
         if self.config.use_normal_tv_loss:
             total_normal_loss += self.normal_tv_loss(pred_normal) * self.config.smooth_loss_lambda
 
+        rgb_loss = 0.0
+        if self.config.use_rgb_loss:
+            image_rgb = batch["image_rgb"]
+            alpha = batch["alpha"]
+            alpha = alpha[:, ...]   
+            image_rgb = image_rgb + (1 - alpha) * outputs["background"]
+            image_rgb = torch.clamp(image_rgb, 0.0, 1.0)
+            image_rgb = image_rgb.squeeze(0)
+            gt_img_rgb = self.get_gt_img(image_rgb)
+            pred_img_rgb = outputs["rgb0"]
+
+            Ll1_rgb = torch.abs(gt_img_rgb - pred_img_rgb).mean()
+            simloss_rgb = 1 - self.ssim(gt_img_rgb.permute(2, 0, 1)[None, ...], pred_img_rgb.permute(2, 0, 1)[None, ...])
+            rgb_loss = (1 - self.config.ssim_lambda) * Ll1_rgb + self.config.ssim_lambda * simloss_rgb
+
         loss_dict = {
-            "main_loss": (1 - self.config.ssim_lambda) * Ll1 + self.config.ssim_lambda * simloss + scale_loss + total_normal_loss,
+            "main_loss": thermal_loss + scale_loss + total_normal_loss + rgb_loss,
             "scale_reg": scale_reg, # 默认是0
         }
 
@@ -704,12 +774,12 @@ class TSplatterModel(SplatfactoModel):
 
             # self.config.refine_every 默认是100
             # self.config.reset_alpha_every 默认是30
-            reset_interval = self.config.reset_alpha_every * self.config.refine_every
+            # reset_interval = self.config.reset_alpha_every * self.config.refine_every
             do_densification = (
                 # self.config.stop_split_at 默认是15000
                 self.step < self.config.stop_split_at
                 # 等数据完整喂完一轮后再进行 densification
-                and self.step % reset_interval > self.num_train_data + self.config.refine_every
+                # and self.step % reset_interval > self.num_train_data + self.config.refine_every
             )
             if do_densification:
                 # then we densify
@@ -817,12 +887,13 @@ class TSplatterModel(SplatfactoModel):
         """
         gt_rgb = self.composite_with_background(self.get_gt_img(batch["image"]), outputs["background"])
         predicted_rgb = outputs["rgb"]
+        predicted_rgb0 = outputs["rgb0"]
         predicted_normal = outputs["normal"]
         surface_normal = outputs["surface_normal"]
         predicted_depth = outputs["depth"]
         depth_color = colormaps.apply_depth_colormap(predicted_depth)
 
-        combined_rgb = torch.cat([gt_rgb, predicted_rgb, depth_color, surface_normal, predicted_normal], dim=1)
+        combined_rgb = torch.cat([gt_rgb, predicted_rgb, depth_color, surface_normal, predicted_normal, predicted_rgb0], dim=1)
 
         # Switch images from [H, W, C] to [1, C, H, W] for metrics computations
         gt_rgb = torch.moveaxis(gt_rgb, -1, 0)[None, ...]
