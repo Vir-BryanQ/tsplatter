@@ -2,3 +2,4 @@ outputs/
 tsplatter.egg-info/
 __pycache__/
 tsplatter/__pycache__/
+ckpts/
