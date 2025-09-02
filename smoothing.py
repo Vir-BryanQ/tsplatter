@@ -15,6 +15,7 @@ os.environ["NUMEXPR_NUM_THREADS"] = "12"
 os.environ["OMP_NUM_THREADS"] = "12"
 import torch
 import torch.nn.functional as F
+from PIL import Image
 from random import randint
 from utils.loss_utils import l1_loss, ssim
 from gaussian_renderer import render, network_gui, count_render
@@ -180,6 +181,7 @@ def majority_voting(gaussians, scene, pipe, background, dataset, args):
     # 对所有feature进行加权求和
     averaged_tensor = torch.matmul(allocate_array.type(torch.float32) ,features_array)
     averaged_tensor /= (averaged_tensor.norm(dim=-1, keepdim=True) + 1e-9)  # 归一化
+
 
     # if args.use_pq:
     #     index = faiss.read_index(args.pq_index)

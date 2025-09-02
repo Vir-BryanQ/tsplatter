@@ -202,7 +202,7 @@ def readColmapSceneInfo(path, images, eval, llffhold=8, orientation_method="up",
         cam_intrinsics = read_intrinsics_text(cameras_intrinsic_file)
 
     poses = []
-    im_ids = cam_extrinsics.keys()
+    im_ids = sorted(cam_extrinsics.keys())
     for im_id in im_ids:
         im_data = cam_extrinsics[im_id]
         rotation = colmap_utils.qvec2rotmat(im_data.qvec)
@@ -210,6 +210,7 @@ def readColmapSceneInfo(path, images, eval, llffhold=8, orientation_method="up",
         w2c = np.concatenate([rotation, translation], 1)    
         w2c = np.concatenate([w2c, np.array([[0, 0, 0, 1]])], 0)    # 转换为齐次矩阵
         c2w = np.linalg.inv(w2c)
+        c2w[0:3, 1:3] *= -1     # OpenCV -> OpenGL
         if assume_colmap_world_coordinate_convention:
             # world coordinate transform: map colmap gravity guess (-y) to nerfstudio convention (+z)
             # 在 COLMAP 中，世界坐标系的重力猜测是 -y 方向，而在 nerfstudio 中，世界坐标系的重力猜测是 +z 方向
@@ -223,6 +224,7 @@ def readColmapSceneInfo(path, images, eval, llffhold=8, orientation_method="up",
         poses.append(c2w)
     poses = torch.from_numpy(np.array(poses).astype(np.float32))
 
+    # 使用OpenGL相机坐标系约定
     poses, _ = camera_utils.auto_orient_and_center_poses(   
         poses,
         method=orientation_method,
@@ -237,7 +239,9 @@ def readColmapSceneInfo(path, images, eval, llffhold=8, orientation_method="up",
     final_scale_factor *= scale_factor    # 1.0
     poses[:, :3, 3] *= final_scale_factor     # 将所有相机位置缩放到 1.0 以内，完成场景的“尺寸归一化”
 
-    im_ids = list(cam_extrinsics.keys())
+    poses[:, 0:3, 1:3] *= -1    # OpenGL -> OpenCV
+
+    im_ids = list(sorted(cam_extrinsics.keys()))
     for i, pose in enumerate(poses):
         # 构造 4x4 齐次矩阵
         c2w = torch.eye(4, dtype=pose.dtype, device=pose.device)
@@ -260,6 +264,7 @@ def readColmapSceneInfo(path, images, eval, llffhold=8, orientation_method="up",
             id=img.id, qvec=qvec, tvec=tvec,
             camera_id=img.camera_id, name=img.name,
             xys=img.xys, point3D_ids=img.point3D_ids)
+    print(cam_extrinsics[1].qvec, cam_extrinsics[1].tvec)
 
     reading_dir = "images_rgb" if images == None else images
     # cam_infos_unsorted是一个list
