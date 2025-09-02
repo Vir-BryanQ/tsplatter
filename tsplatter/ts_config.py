@@ -13,14 +13,14 @@ from nerfstudio.plugins.types import MethodSpecification
 tsplatter = MethodSpecification(
     config=TrainerConfig(
         method_name="tsplatter",
-        steps_per_eval_image=100,
-        steps_per_eval_batch=100,
-        # steps_per_eval_image=5,
-        # steps_per_eval_batch=5,
+        # steps_per_eval_image=100,
+        # steps_per_eval_batch=100,
+        steps_per_eval_image=5,
+        steps_per_eval_batch=5,
         steps_per_save=1000000,
         steps_per_eval_all_images=1000000,
-        max_num_iterations=30000,
-        # max_num_iterations=750,
+        # max_num_iterations=30000,
+        max_num_iterations=300,
         mixed_precision=False,
         gradient_accumulation_steps={"camera_opt": 100, "color": 10, "shs": 10},
 
@@ -28,19 +28,19 @@ tsplatter = MethodSpecification(
             datamanager=TSplatterManagerConfig(
                 dataparser=ThermalMapDataParserConfig()
             ),
-            model=TSplatterModelConfig(),
-            # model=TSplatterModelConfig(
-            #     cull_alpha_thresh=0.005,
-            #     continue_cull_post_densification=False,
-            # ),
+            # model=TSplatterModelConfig(),
+            model=TSplatterModelConfig(
+                cull_alpha_thresh=0.005,
+                continue_cull_post_densification=False,
+            ),
         ),
         
         optimizers={
             "means": {
                 "optimizer": AdamOptimizerConfig(lr=1.6e-4, eps=1e-15),
                 "scheduler": ExponentialDecaySchedulerConfig(
-                    lr_final=1.6e-6, max_steps=30000
-                    # lr_final=1.6e-6, max_steps=750
+                    # lr_final=1.6e-6, max_steps=30000
+                    lr_final=1.6e-6, max_steps=300
                 ),
             },
             "opacities": {
@@ -91,8 +91,8 @@ tsplatter = MethodSpecification(
             "camera_opt": {
                 "optimizer": AdamOptimizerConfig(lr=1e-3, eps=1e-15),
                 "scheduler": ExponentialDecaySchedulerConfig(
-                    lr_final=5e-5, max_steps=30000
-                    # lr_final=5e-5, max_steps=750
+                    # lr_final=5e-5, max_steps=30000
+                    lr_final=5e-5, max_steps=300
                 ),
             },
         },

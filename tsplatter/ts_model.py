@@ -143,11 +143,11 @@ def get_scale_loss(scales):
 @dataclass
 class TSplatterModelConfig(SplatfactoModelConfig):
     _target: Type = field(default_factory=lambda: TSplatterModel)
-    warmup_length: int = 500
-    # warmup_length: int = 0
+    # warmup_length: int = 500
+    warmup_length: int = 0
     """period of steps where refinement is turned off"""
-    refine_every: int = 100
-    # refine_every: int = 5
+    # refine_every: int = 100
+    refine_every: int = 5
     """period of steps where gaussians are culled and densified"""
     # resolution_schedule: int = 3000
     resolution_schedule: int = 150
@@ -188,8 +188,8 @@ class TSplatterModelConfig(SplatfactoModelConfig):
     "Size of the cube to initialize random gaussians within"
     ssim_lambda: float = 0.2
     """weight of ssim loss"""
-    stop_split_at: int = 15000
-    # stop_split_at: int = 375
+    # stop_split_at: int = 15000
+    stop_split_at: int = 150
     """stop splitting at this step"""
     sh_degree: int = 0
     """maximum degree of spherical harmonics to use"""
