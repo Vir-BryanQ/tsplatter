@@ -11,11 +11,13 @@
 
 import os
 import sys
+import torch
 from PIL import Image
 from pathlib import Path
 from typing import NamedTuple
 from scene.colmap_loader import read_extrinsics_text, read_intrinsics_text, qvec2rotmat, \
     read_extrinsics_binary, read_intrinsics_binary, read_points3D_binary, read_points3D_text
+from scene.colmap_loader import Image as ColmapImage
 from utils.graphics_utils import getWorld2View2, focal2fov, fov2focal
 import numpy as np
 import json
@@ -235,7 +237,8 @@ def readColmapSceneInfo(path, images, eval, llffhold=8, orientation_method="up",
     final_scale_factor *= scale_factor    # 1.0
     poses[:, :3, 3] *= final_scale_factor     # 将所有相机位置缩放到 1.0 以内，完成场景的“尺寸归一化”
 
-    for i, pose in poses:
+    im_ids = list(cam_extrinsics.keys())
+    for i, pose in enumerate(poses):
         # 构造 4x4 齐次矩阵
         c2w = torch.eye(4, dtype=pose.dtype, device=pose.device)
         c2w[:3, :4] = pose
@@ -253,7 +256,7 @@ def readColmapSceneInfo(path, images, eval, llffhold=8, orientation_method="up",
 
         im_id = im_ids[i]
         img = cam_extrinsics[im_id]
-        cam_extrinsics[im_id] = Image(
+        cam_extrinsics[im_id] = ColmapImage(
             id=img.id, qvec=qvec, tvec=tvec,
             camera_id=img.camera_id, name=img.name,
             xys=img.xys, point3D_ids=img.point3D_ids)
@@ -268,15 +271,17 @@ def readColmapSceneInfo(path, images, eval, llffhold=8, orientation_method="up",
     cam_infos = sorted(cam_infos_unsorted.copy(), key = lambda x : x.image_name)
 
     with (Path(path) / "train_list.txt").open("r", encoding="utf8") as f:
-        filenames = [line for line in f.read().splitlines() if line.strip()]
+        filenames = [line.strip() for line in f.read().splitlines() if line.strip()]
     image_filenames = [image.name for image in cam_extrinsics.values()]
 
     # 检测 split_filenames 中的文件名是否在 image_filenames 中存在
-    unmatched_filenames = filenames.difference(image_filenames)   # 找出在 split_filenames 中 存在，但在 image_filenames 中 不存在 的文件名，即集合差值A - B
+    unmatched_filenames = set(filenames).difference(image_filenames)   # 找出在 split_filenames 中 存在，但在 image_filenames 中 不存在 的文件名，即集合差值A - B
     if unmatched_filenames:
         raise RuntimeError(
             f"Some filenames for split {split} were not found: {set(map(str, unmatched_filenames))}."
         )
+
+    filenames = [name.split('.')[0] for name in filenames]
 
     # self.eval = False
     if eval:
@@ -286,6 +291,7 @@ def readColmapSceneInfo(path, images, eval, llffhold=8, orientation_method="up",
         train_cam_infos = cam_infos
         # 用于训练温度场的相机视角
         test_cam_infos = [cam_info for cam_info in cam_infos if cam_info.image_name in filenames]
+
 
     # 根据多个相机的位置计算一个包围整个场景的球形范围，返回这个范围的中心（translate）和半径（radius）
     nerf_normalization = getNerfppNorm(train_cam_infos)
@@ -306,6 +312,7 @@ def readColmapSceneInfo(path, images, eval, llffhold=8, orientation_method="up",
     # except:
     #     pcd = None
 
+    ply_path = ''
     pcd = None
 
     scene_info = SceneInfo(point_cloud=pcd,

@@ -14,12 +14,13 @@ os.environ["MKL_NUM_THREADS"] = "12"
 os.environ["NUMEXPR_NUM_THREADS"] = "12"
 os.environ["OMP_NUM_THREADS"] = "12"
 import torch
+import torch.nn.functional as F
 from random import randint
 from utils.loss_utils import l1_loss, ssim
 from gaussian_renderer import render, network_gui, count_render
 import sys
 from scene import Scene, GaussianModel
-from utils_gs.general_utils import safe_state
+from utils.general_utils import safe_state
 import uuid
 from tqdm import tqdm
 from utils.image_utils import psnr
@@ -34,7 +35,7 @@ import numpy as np
 import faiss
 import gc
 
-from autoencoder.model import Autoencoder
+# from autoencoder.model import Autoencoder
 
 from sklearn.metrics.pairwise import cosine_similarity
 from sklearn.neighbors import NearestNeighbors
@@ -212,18 +213,25 @@ def cosine_similarity_clustering(features, threshold=0.8):
     :return: 每个高斯点的聚类索引
     """
     N = features.shape[0]
-    similarity_matrix = cosine_similarity(features.cpu().numpy())  # 计算余弦相似度
+
+    # 初始化聚类标签
     clusters = -1 * np.ones(N)  # 初始化所有点的聚类标签为-1
     cluster_id = 0
-    
+
+    # 将输入的features移到CPU上
+    features_cpu = features.cpu().numpy()
+
+    # 遍历每一对高斯点并计算它们的余弦相似度
     for i in range(N):
         if clusters[i] == -1:  # 如果当前点没有被分配到任何一个聚类
             clusters[i] = cluster_id
             for j in range(i + 1, N):
-                if similarity_matrix[i, j] > threshold:  # 如果两个点的余弦相似度大于阈值
+                # 逐对计算余弦相似度
+                sim = cosine_similarity([features_cpu[i]], [features_cpu[j]])[0, 0]
+                if sim > threshold:  # 如果两个点的余弦相似度大于阈值
                     clusters[j] = cluster_id  # 将其分到同一类
             cluster_id += 1
-    
+
     return torch.tensor(clusters)
 
 # 2. KNN构建边赋权图
@@ -372,7 +380,7 @@ def temperature_propagation(gaussians, scene, pipe, background, dataset, args):
     
 # training(lp.extract(args), op.extract(args), pp.extract(args), 
 # args.test_iterations, args.save_iterations, args.checkpoint_iterations, args.start_checkpoint, args.debug_from, args)
-def smoothing(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from, args):
+def smoothing(dataset, opt, pipe, checkpoint, args):
     gaussians = GaussianModel(dataset.sh_degree)    # 简单地给所有属性赋空值
     scene = Scene(dataset, gaussians)
     
@@ -411,8 +419,8 @@ def smoothing(dataset, opt, pipe, testing_iterations, saving_iterations, checkpo
     gaussians._thermal_features_dc = thermal_features[:, 0, :]
     gaussians._thermal_features_rest = thermal_features[:, 1:, :]
 
-    ckpt["pipeline"]["_model.gauss_params.thermal_features_dc"] = gaussians._thermal_features_dc
-    ckpt["pipeline"]["_model.gauss_params.thermal_features_rest"] = gaussians._thermal_features_rest
+    ckpt["pipeline"]["_model.gauss_params.thermal_features_dc"] = gaussians._thermal_features_dc.cpu()
+    ckpt["pipeline"]["_model.gauss_params.thermal_features_rest"] = gaussians._thermal_features_rest.cpu()
     base_name, ext = os.path.splitext(checkpoint)
     new_checkpoint = base_name + "_origin" + ext
     os.rename(checkpoint, new_checkpoint)
@@ -526,7 +534,7 @@ if __name__ == "__main__":
     #                     )
     # parser.add_argument("--faiss_add", action="store_true")
     args = parser.parse_args(sys.argv[1:])
-    args.save_iterations.append(args.iterations)
+    # args.save_iterations.append(args.iterations)
     # index = faiss.read_index(args.pq_index)
 
     # try:
@@ -545,7 +553,7 @@ if __name__ == "__main__":
     # 调用 torch.autograd.set_detect_anomaly(True) 后，PyTorch 会在反向传播时逐步检查每个算子 的梯度计算，一旦发现 NaN 或 inf，就会立刻报错，并指出具体是在哪个算子里出现的异常
     # 开启 anomaly detection 会显著降低训练速度（因为要逐步检查每一步运算），通常只在 调试阶段 使用，定位问题后应关闭
     torch.autograd.set_detect_anomaly(args.detect_anomaly)
-    smoothing(lp.extract(args), op.extract(args), pp.extract(args), args.test_iterations, args.save_iterations, args.checkpoint_iterations, args.start_checkpoint, args.debug_from, args)
+    smoothing(lp.extract(args), op.extract(args), pp.extract(args), args.start_checkpoint, args)
 
     # All done
     print("\nSmoothing complete.")

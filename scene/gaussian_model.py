@@ -134,14 +134,14 @@ class GaussianModel:
         #     self.denom = denom
 
         self.active_sh_degree =  int((model_args['features_rest'].shape[1] + 1) **  0.5 - 1)
-        self._xyz = model_args['means']
-        self._features_dc = model_args['features_dc'].unsqueeze(-1)
-        self._features_rest = model_args['features_rest'].permute(0, 2, 1)
-        self._thermal_features_dc = model_args['thermal_features_dc']
-        self._thermal_features_rest = model_args['thermal_features_rest']
-        self._scaling = model_args['scales']
-        self._rotation = model_args['quats']
-        self._opacity = model_args['opacities']
+        self._xyz = model_args['means'].cuda()
+        self._features_dc = model_args['features_dc'].cuda()
+        self._features_rest = model_args['features_rest'].cuda()
+        self._thermal_features_dc = model_args['thermal_features_dc'].cuda()
+        self._thermal_features_rest = model_args['thermal_features_rest'].cuda()
+        self._scaling = model_args['scales'].cuda()
+        self._rotation = model_args['quats'].cuda()
+        self._opacity = model_args['opacities'].cuda()
 
     def restore_eval(self, model_args):
         (self.active_sh_degree, 
@@ -175,7 +175,7 @@ class GaussianModel:
     def get_features(self):
         features_dc = self._features_dc
         features_rest = self._features_rest
-        return torch.cat((features_dc, features_rest), dim=1)
+        return torch.cat((features_dc[:, None, :], features_rest), dim=1)
 
     @property
     def get_thermal_features(self):
@@ -220,8 +220,10 @@ class GaussianModel:
         # language_feature = torch.zeros((fused_point_cloud.shape[0], 512), device="cuda")
         
         self._xyz = nn.Parameter(fused_point_cloud.requires_grad_(True))
+        # 带转置
         self._features_dc = nn.Parameter(features[:,:,0:1].transpose(1, 2).contiguous().requires_grad_(True))
         self._features_rest = nn.Parameter(features[:,:,1:].transpose(1, 2).contiguous().requires_grad_(True))
+
         self._scaling = nn.Parameter(scales.requires_grad_(True))
         self._rotation = nn.Parameter(rots.requires_grad_(True))
         self._opacity = nn.Parameter(opacities.requires_grad_(True))
