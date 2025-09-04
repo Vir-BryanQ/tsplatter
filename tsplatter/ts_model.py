@@ -8,7 +8,7 @@ from rich.progress import track
 from pathlib import Path
 import torchvision.utils as vutils
 
-import torch
+import torch, gc
 import torch.nn.functional as F
 import torchvision.transforms.functional as TF
 from torch import Tensor
@@ -144,7 +144,7 @@ def get_scale_loss(scales):
 class TSplatterModelConfig(SplatfactoModelConfig):
     _target: Type = field(default_factory=lambda: TSplatterModel)
     # warmup_length: int = 500
-    warmup_length: int = 0
+    warmup_length: int = 10
     """period of steps where refinement is turned off"""
     # refine_every: int = 100
     refine_every: int = 5
@@ -227,6 +227,7 @@ class TSplatterModelConfig(SplatfactoModelConfig):
     use_rgb_loss: bool = True
     disable_refinement: bool = False
     use_vanilla_sh: bool = False
+    use_merge_sparsification: bool = True # disable_refinement should be False
 
 class TSplatterModel(SplatfactoModel):
     config: TSplatterModelConfig
@@ -757,9 +758,484 @@ class TSplatterModel(SplatfactoModel):
                 out[name] = param[split_mask].repeat(samps, 1)
         return out
 
+    def dup_gaussians(self, dup_mask):
+        """
+        This function duplicates gaussians that are too small
+        """
+        n_dups = dup_mask.sum().item()
+        CONSOLE.log(f"Duplicating {dup_mask.sum().item()/self.num_points} gaussians: {n_dups}/{self.num_points}")
+        new_dups = {}
+        for name, param in self.gauss_params.items():
+            # 直接复制一组完全一样的高斯
+            new_dups[name] = param[dup_mask]
+        return new_dups
+
+    def cull_gaussians(self, extra_cull_mask: Optional[torch.Tensor] = None):
+        """
+        This function deletes gaussians with under a certain opacity threshold
+        extra_cull_mask: a mask indicates extra gaussians to cull besides existing culling criterion
+        """
+        n_bef = self.num_points
+        # cull transparent ones
+        # cull_alpha_thresh: float = 0.1
+        # .squeeze()会删除所有形状为1的维度
+        culls = (torch.sigmoid(self.opacities) < self.config.cull_alpha_thresh).squeeze()
+        # 调用 .item() 会将 torch.sum(culls) 的单一数值提取为一个 Python 原生的 int 或 float 类型
+        # 尝试对一个 非标量张量 使用 .item() 方法，PyTorch 会抛出一个错误
+        below_alpha_count = torch.sum(culls).item()
+        toobigs_count = 0
+        if extra_cull_mask is not None:
+            culls = culls | extra_cull_mask
+
+        # if self.step > self.config.refine_every * self.config.reset_alpha_every:
+            # cull huge ones
+            # cull_scale_thresh: float = 0.5
+            # torch.exp(self.scales).max(dim=-1) 返回的是元组 (values, indices)：
+            # 一个形状为 [N] 的张量，包含每一行的最大值（values）
+            # 一个形状为 [N] 的张量，包含每一行最大值的列索引（indices）
+            # toobigs = (torch.exp(self.scales).max(dim=-1).values > self.config.cull_scale_thresh).squeeze()
+            # 绝对大小和相对大小
+            # if self.step < self.config.stop_screen_size_at:
+                # stop_screen_size_at: int = 4000
+                # cull big screen space
+                # if self.max_2Dsize is not None:
+                    # cull_screen_size: float = 0.15
+                    # toobigs = toobigs | (self.max_2Dsize > self.config.cull_screen_size).squeeze()
+            # culls = culls | toobigs
+            # toobigs_count = torch.sum(toobigs).item()
+            
+        for name, param in self.gauss_params.items():
+            self.gauss_params[name] = torch.nn.Parameter(param[~culls])
+
+        CONSOLE.log(
+            f"Culled {n_bef - self.num_points} gaussians "
+            f"({below_alpha_count} below alpha thresh, {toobigs_count} too bigs, {self.num_points} remaining)"
+        )
+
+        return culls
+
+    def after_train(self, step: int):
+        assert step == self.step
+        # to save some training time, we no longer need to update those stats post refinement
+        if self.step >= self.config.stop_split_at and not self.config.use_merge_sparsification:
+            return
+        with torch.no_grad():
+            # keep track of a moving average of grad norms
+            visible_mask = (self.radii > 0).flatten()   # [M]
+            grads = self.xys.absgrad[0][visible_mask].norm(dim=-1)  # [M,2]  norm: [M] 默认是L2范数
+            # print(f"grad norm min {grads.min().item()} max {grads.max().item()} mean {grads.mean().item()} size {grads.shape}")
+            if self.xys_grad_norm is None:
+                # self.num_points是一个@property方法，返回高斯数目
+                self.xys_grad_norm = torch.zeros(self.num_points, device=self.device, dtype=torch.float32)  # [N]
+                # 记录每个点被看见的次数，初始化为全1是为了避免除0错误
+                self.vis_counts = torch.ones(self.num_points, device=self.device, dtype=torch.float32)  # [N]
+            assert self.vis_counts is not None
+            self.vis_counts[visible_mask] += 1
+            self.xys_grad_norm[visible_mask] += grads
+            # update the max screen size, as a ratio of number of pixels
+            if self.max_2Dsize is None:
+                self.max_2Dsize = torch.zeros_like(self.radii, dtype=torch.float32)
+            newradii = self.radii.detach()[visible_mask]
+            # 把当前可见点的 radius 投影到屏幕（归一化成 0~1）；
+            # 与历史最大值做对比，保留更大的值；
+            self.max_2Dsize[visible_mask] = torch.maximum(
+                self.max_2Dsize[visible_mask],
+                newradii / float(max(self.last_size[0], self.last_size[1])),
+            )
+
+    def remove_from_optim(self, optimizer, deleted_mask, new_params):
+        """removes the deleted_mask from the optimizer provided"""
+        assert len(new_params) == 1
+        # assert isinstance(optimizer, torch.optim.Adam), "Only works with Adam"
+
+        param = optimizer.param_groups[0]["params"][0]
+        param_state = optimizer.state[param]
+        del optimizer.state[param]
+
+        # Modify the state directly without deleting and reassigning.
+        if "exp_avg" in param_state:
+            param_state["exp_avg"] = param_state["exp_avg"][~deleted_mask]
+            param_state["exp_avg_sq"] = param_state["exp_avg_sq"][~deleted_mask]
+
+        # Update the parameter in the optimizer's param group.
+        del optimizer.param_groups[0]["params"][0]
+        del optimizer.param_groups[0]["params"]
+        optimizer.param_groups[0]["params"] = new_params
+        optimizer.state[new_params[0]] = param_state
+
+    def remove_from_all_optim(self, optimizers, deleted_mask):
+        param_groups = self.get_gaussian_param_groups() 
+        for group, param in param_groups.items():
+            self.remove_from_optim(optimizers.optimizers[group], deleted_mask, param)
+        torch.cuda.empty_cache()
+
+    def dup_in_optim(self, optimizer, dup_mask, new_params, n=2):
+        """adds the parameters to the optimizer"""
+        param = optimizer.param_groups[0]["params"][0]
+        param_state = optimizer.state[param]
+        if "exp_avg" in param_state:
+            # 生成一个长度为 d-1 的元组，每个元素都是 1，并拼接成(n, 1, 1, ..., 1)
+            repeat_dims = (n,) + tuple(1 for _ in range(param_state["exp_avg"].dim() - 1))
+            # 一阶动量
+            param_state["exp_avg"] = torch.cat(
+                [
+                    param_state["exp_avg"],
+                    torch.zeros_like(param_state["exp_avg"][dup_mask.squeeze()]).repeat(*repeat_dims),
+                ],
+                dim=0,
+            )
+            # 二阶动量
+            param_state["exp_avg_sq"] = torch.cat(
+                [
+                    param_state["exp_avg_sq"],
+                    torch.zeros_like(param_state["exp_avg_sq"][dup_mask.squeeze()]).repeat(*repeat_dims),
+                ],
+                dim=0,
+            )
+        del optimizer.state[param]
+        optimizer.state[new_params[0]] = param_state
+        optimizer.param_groups[0]["params"] = new_params
+        del param
+
+    def dup_in_all_optim(self, optimizers, dup_mask, n):
+        param_groups = self.get_gaussian_param_groups() # 字典，value是[param]
+        for group, param in param_groups.items():
+            self.dup_in_optim(optimizers.optimizers[group], dup_mask, param, n)
+
+    def merge_in_optim(self, optimizer, new_params, n):
+        param = optimizer.param_groups[0]["params"][0]
+        param_state = optimizer.state[param]
+        if "exp_avg" in param_state:
+            shape = (n,) + param_state["exp_avg"].shape[1:]
+            param_state["exp_avg"] = torch.cat(
+                [
+                    param_state["exp_avg"],
+                    torch.zeros(shape, device=param_state["exp_avg"].device, dtype=param_state["exp_avg"].dtype),
+                ],
+                dim=0,
+            )
+            shape = (n,) + param_state["exp_avg_sq"].shape[1:]
+            param_state["exp_avg_sq"] = torch.cat(
+                [
+                    param_state["exp_avg_sq"],
+                    torch.zeros(shape, device=param_state["exp_avg_sq"].device, dtype=param_state["exp_avg_sq"].dtype),
+                ],
+                dim=0,
+            )
+        del optimizer.state[param]
+        optimizer.state[new_params[0]] = param_state
+        optimizer.param_groups[0]["params"] = new_params
+        del param
+
+    def merge_in_all_optim(self, optimizers, n):
+        param_groups = self.get_gaussian_param_groups() 
+        for group, param in param_groups.items():
+            self.merge_in_optim(optimizers.optimizers[group], param, n)
+
+
+    def quat_to_rotmat(self, q):
+        q = F.normalize(q, dim=-1)
+        qw, qx, qy, qz = q.unbind(-1)
+        R = torch.stack([
+            1 - 2*qy**2 - 2*qz**2, 2*qx*qy - 2*qz*qw,     2*qx*qz + 2*qy*qw,
+            2*qx*qy + 2*qz*qw,     1 - 2*qx**2 - 2*qz**2, 2*qy*qz - 2*qx*qw,
+            2*qx*qz - 2*qy*qw,     2*qy*qz + 2*qx*qw,     1 - 2*qx**2 - 2*qy**2
+        ], dim=-1).reshape(q.shape[:-1] + (3, 3))
+        return R
+
+    def rotmat_to_quat(self, R):
+        m = R
+        t = m[...,0,0] + m[...,1,1] + m[...,2,2]
+        qw = torch.sqrt(torch.clamp(1 + t, min=0)) / 2
+        qx = torch.sqrt(torch.clamp(1 + m[...,0,0] - m[...,1,1] - m[...,2,2], min=0)) / 2
+        qy = torch.sqrt(torch.clamp(1 - m[...,0,0] + m[...,1,1] - m[...,2,2], min=0)) / 2
+        qz = torch.sqrt(torch.clamp(1 - m[...,0,0] - m[...,1,1] + m[...,2,2], min=0)) / 2
+        qx = torch.copysign(qx, m[...,2,1] - m[...,1,2])
+        qy = torch.copysign(qy, m[...,0,2] - m[...,2,0])
+        qz = torch.copysign(qz, m[...,1,0] - m[...,0,1])
+        q = torch.stack([qw, qx, qy, qz], dim=-1)
+        return F.normalize(q, dim=-1)
+
+    # ---------------- 协方差处理 ----------------
+    def get_covariance(self, quats, scales):
+        R = self.quat_to_rotmat(quats)              # [N,3,3]
+        S = torch.diag_embed(scales**2)             # [N,3,3]
+        return R @ S @ R.transpose(-1, -2)          # [N,3,3]
+
+    def decompose_covariance(self, Sigma):
+        eigvals, eigvecs = torch.linalg.eigh(Sigma)  # [N,3], [N,3,3]
+        scales = torch.sqrt(torch.clamp(eigvals, min=1e-8))
+        q = self.rotmat_to_quat(eigvecs)
+        return q, scales
+
+    def unique_pairs(self, i_idx, j_idx, M1, M):
+        """
+        从候选对 (i_idx, j_idx) 中筛选唯一配对，
+        保证每个 i ∈ [0, M1) 和每个 j ∈ [0, M) 最多只出现一次。
+
+        参数:
+            i_idx: LongTensor [P]  (候选对中的 i 索引)
+            j_idx: LongTensor [P]  (候选对中的 j 索引)
+            M1: int (i 的最大范围，通常 = pair_mask.size(0))
+            M: int (j 的最大范围，通常 = pair_mask.size(1))
+
+        返回:
+            i_idx_new: LongTensor [Q]
+            j_idx_new: LongTensor [Q]
+        """
+        device = i_idx.device
+        P = i_idx.size(0)
+
+        if P == 0:
+            return i_idx, j_idx  # 空输入直接返回
+
+        # step1: 生成全局顺序 (保证 pair 唯一)
+        order = torch.arange(P, device=device)
+        # 这里可以自定义排序规则，比如按 i 再按 j
+        # order = torch.argsort(i_idx * M + j_idx)
+
+        i_idx = i_idx[order]
+        j_idx = j_idx[order]
+
+        # step2: 记录每个 i 第一次出现的位置
+        pos_i = torch.full((M1,), P, dtype=torch.long, device=device)
+        rev = torch.arange(P - 1, -1, -1, device=device)  # 倒序
+        pos_i.scatter_(0, i_idx[rev], rev)  # 保留最小下标
+        first_i = pos_i[pos_i < P]
+
+        # step3: 记录每个 j 第一次出现的位置
+        pos_j = torch.full((M,), P, dtype=torch.long, device=device)
+        pos_j.scatter_(0, j_idx[rev], rev)
+        first_j = pos_j[pos_j < P]
+
+        # step4: 构造布尔掩码
+        mask = torch.zeros(P, dtype=torch.bool, device=device)
+        mask[first_i] = True
+        mask[first_j] = mask[first_j] & True  # 保证 i/j 都唯一
+
+        # step5: 筛选
+        i_idx_new = i_idx[mask]
+        j_idx_new = j_idx[mask]
+
+        return i_idx_new, j_idx_new
+
+    def merge_params_blockwise(self, mu_i, mu_j, Sigma_i, Sigma_j, alpha_i, alpha_j, f_i, f_j, block_size=1000000):
+        """
+        分块计算新高斯参数，避免一次性占用过多显存。
+        输入: 各个张量形状 [num_pairs, ...]
+        输出: mu_new, Sigma_new, alpha_new, f_new
+        """
+        num_pairs = mu_i.shape[0]
+        device = mu_i.device
+
+        mu_new_list = []
+        Sigma_new_list = []
+        alpha_new_list = []
+        f_new_list = []
+
+        for start in range(0, num_pairs, block_size):
+            end = min(start + block_size, num_pairs)
+
+            mu_i_blk = mu_i[start:end]
+            mu_j_blk = mu_j[start:end]
+            Sigma_i_blk = Sigma_i[start:end]
+            Sigma_j_blk = Sigma_j[start:end]
+            alpha_i_blk = alpha_i[start:end]
+            alpha_j_blk = alpha_j[start:end]
+            f_i_blk = f_i[start:end]
+            f_j_blk = f_j[start:end]
+
+            alpha_sum_blk = alpha_i_blk + alpha_j_blk
+
+            # 新均值
+            mu_new_blk = (alpha_i_blk[:, None] * mu_i_blk + alpha_j_blk[:, None] * mu_j_blk) / alpha_sum_blk[:, None]
+
+            # 外积（逐元素方式，避免广播成 NxN）
+            mu_i_outer = mu_i_blk[:, :, None] * mu_i_blk[:, None, :]
+            mu_j_outer = mu_j_blk[:, :, None] * mu_j_blk[:, None, :]
+
+            # 新协方差
+            Sigma_new_blk = (alpha_i_blk[:, None, None] * (Sigma_i_blk + mu_i_outer) +
+                            alpha_j_blk[:, None, None] * (Sigma_j_blk + mu_j_outer))
+
+            Sigma_new_blk = Sigma_new_blk / alpha_sum_blk[:, None, None] \
+                        - mu_new_blk[:, :, None] * mu_new_blk[:, None, :]
+
+            # 新不透明度
+            alpha_new_blk = alpha_i_blk + alpha_j_blk - alpha_i_blk * alpha_j_blk
+
+            # 新颜色
+            f_new_blk = (alpha_i_blk[:, None] * f_i_blk + alpha_j_blk[:, None] * f_j_blk) / alpha_sum_blk[:, None]
+
+            # 收集结果
+            mu_new_list.append(mu_new_blk)
+            Sigma_new_list.append(Sigma_new_blk)
+            alpha_new_list.append(alpha_new_blk)
+            f_new_list.append(f_new_blk)
+
+            # 手动释放中间变量，减少显存压力
+            del mu_i_blk, mu_j_blk, Sigma_i_blk, Sigma_j_blk
+            del alpha_i_blk, alpha_j_blk, f_i_blk, f_j_blk
+            del mu_i_outer, mu_j_outer, mu_new_blk, Sigma_new_blk, alpha_new_blk, f_new_blk
+            gc.collect()
+
+        # 拼接分块结果
+        mu_new = torch.cat(mu_new_list, dim=0)
+        Sigma_new = torch.cat(Sigma_new_list, dim=0)
+        alpha_new = torch.cat(alpha_new_list, dim=0)
+        f_new = torch.cat(f_new_list, dim=0)
+
+        return mu_new, Sigma_new, alpha_new, f_new
+
+    def merge_gaussians(self, merge_mask, k=5, color_thresh=0.1, dist_thresh=2.38, sample_bound=5000):
+        N = self.means.shape[0]
+        device = self.means.device
+
+        means = self.means[merge_mask]                # [M,3]
+        quats = self.quats[merge_mask]
+        scales = torch.exp(self.scales[merge_mask])
+        opacities = torch.sigmoid(self.opacities[merge_mask]).squeeze(-1)
+        colors = self.thermal_features_dc[merge_mask]
+
+        covs = self.get_covariance(quats, scales)     # [M,3,3]
+        M = means.shape[0]
+
+        # -------- 采样 M1 个主动合并者 --------
+        M1 = min(M, sample_bound)
+        sampled_idx = torch.randperm(M, device=device)[:M1]  # [M1]
+        means_sampled = means[sampled_idx]
+
+        # -------- KNN 搜索 (欧式距离) --------
+        euclidean_dists = torch.cdist(means_sampled, means)   # [M1,M]
+        knn_idx = euclidean_dists.topk(k+1, largest=False).indices[:,1:]  # [M1,k]
+
+        del euclidean_dists
+        gc.collect()
+
+        # -------- Mahalanobis 距离 --------
+        diff = means_sampled[:,None,:] - means[None,:,:]      # [M1,M,3]
+        inv_covs = torch.linalg.pinv(covs)                    # [M,3,3]
+
+        # d_ij: 使用 j 的协方差
+        d_ij = torch.einsum('imj,mjk,imk->im', diff, inv_covs, diff)
+
+        # d_ji: 使用 i 的协方差
+        inv_covs_i = inv_covs[sampled_idx]                  # [M1,3,3]
+        d_ji = torch.einsum('imj,ijk,imk->im', diff, inv_covs_i, diff)
+
+        del diff
+        gc.collect()
+
+        d_ij = torch.clamp(d_ij, min=1e-8)
+        d_ji = torch.clamp(d_ji, min=1e-8)
+
+        # 取对称化距离
+        d_m = torch.max(d_ij, d_ji) # [M1,M]
+
+        del d_ij, d_ji
+        gc.collect()
+
+        # -------- 颜色距离 --------
+        color_diff = torch.cdist(means_sampled, means, p=1) # [M1,M]
+
+        # -------- 条件过滤 (限制在 knn 内) --------
+        valid_mask = (d_m < dist_thresh) & (color_diff < color_thresh)
+
+        del color_diff, d_m
+        gc.collect()
+
+        knn_mask = torch.zeros_like(valid_mask, dtype=torch.bool)  # [M1,M]
+        knn_mask.scatter_(1, knn_idx, True)
+        pair_mask = valid_mask & knn_mask
+
+        del valid_mask, knn_mask
+        gc.collect()
+
+        i_idx, j_idx = torch.where(pair_mask)  # i in [M1], j in [M]
+        i_idx, j_idx = self.unique_pairs(i_idx, j_idx, M1=pair_mask.size(0), M=pair_mask.size(1))
+
+        del pair_mask
+        gc.collect()
+
+        if i_idx.numel() == 0:
+            return None, torch.zeros(N, dtype=torch.bool, device=device)
+
+        # -------- 合并计算 (批量) --------
+        mu_i, mu_j = means_sampled[i_idx], means[j_idx]
+        Sigma_i, Sigma_j = covs[sampled_idx[i_idx]], covs[j_idx]
+        alpha_i, alpha_j = opacities[sampled_idx[i_idx]], opacities[j_idx]
+        f_i, f_j = colors[sampled_idx[i_idx]], colors[j_idx]
+
+        mu_new, Sigma_new, alpha_new, f_new = self.merge_params_blockwise(
+            mu_i, mu_j, Sigma_i, Sigma_j, alpha_i, alpha_j, f_i, f_j
+        )
+
+        q_new, s_new = self.decompose_covariance(Sigma_new)
+
+        out = {
+            "means": mu_new,
+            "thermal_features_dc": f_new,
+            "opacities": torch.logit(alpha_new).unsqueeze(1),
+            "scales": torch.log(s_new),
+            "quats": q_new,
+        }
+        for name, param in self.gauss_params.items():
+            if name not in out:
+                # p_i, p_j = param[sampled_idx[i_idx]], param[j_idx]   # [num_pairs,...]
+                # weight_i = alpha_i.view(-1, *([1] * (p_i.ndim - 1)))
+                # weight_j = alpha_j.view(-1, *([1] * (p_j.ndim - 1)))
+                # denom = alpha_sum.view(-1, *([1] * (p_i.ndim - 1)))
+                # p_new = (weight_i * p_i + weight_j * p_j) / denom
+                # out[name] = p_new
+                shape = (mu_i.shape[0],) + param.shape[1:]
+                out[name] = torch.zeros(shape, device=param.device, dtype=param.dtype)
+
+        merged_mask = torch.zeros(N + mu_i.shape[0], dtype=torch.bool, device=device)
+        idx_map = merge_mask.nonzero(as_tuple=True)[0]  # [M]
+        merged_mask[idx_map[sampled_idx[i_idx]]] = True
+        merged_mask[idx_map[j_idx]] = True
+
+        return out, merged_mask
+
     def refinement_after(self, optimizers: Optimizers, step):
         if self.config.disable_refinement:
             return 
+
+        if self.step <= self.config.warmup_length:
+            # 训练开始阶段不进行refinement
+            return
+
+        if self.config.use_merge_sparsification:
+            avg_grad_norm = (self.xys_grad_norm / self.vis_counts) * 0.5 * max(self.last_size[0], self.last_size[1])
+            merges = (avg_grad_norm < self.config.densify_grad_thresh).squeeze()
+            merge_params, merges_mask = self.merge_gaussians(merges)
+
+            if merge_params:
+                for name, param in self.gauss_params.items():
+                    self.gauss_params[name] = torch.nn.Parameter(
+                        torch.cat([param.detach(), merge_params[name]], dim=0)
+                    )
+                # append zeros to the max_2Dsize tensor
+                self.max_2Dsize = torch.cat(
+                    [
+                        self.max_2Dsize,
+                        torch.zeros_like(merge_params["scales"][:, 0]),
+                    ],
+                    dim=0,
+                )
+
+                self.merge_in_all_optim(optimizers, merge_params["scales"].shape[0])
+
+            deleted_mask = self.cull_gaussians(merges_mask)
+
+            if deleted_mask is not None:
+                self.remove_from_all_optim(optimizers, deleted_mask)
+
+            self.xys_grad_norm = None
+            self.vis_counts = None
+            self.max_2Dsize = None
+            return 
+
 
         assert step == self.step
         # self.config.warmup_length 500
@@ -786,9 +1262,9 @@ class TSplatterModel(SplatfactoModel):
                 assert self.xys_grad_norm is not None and self.vis_counts is not None and self.max_2Dsize is not None
 
                 #对于高位置梯度的所有高斯，高于densify_size_thresh的高斯进行split，小于等于densify_size_thresh的高斯进行duplicate
-                avg_grad_norm = (self.xys_grad_norm / self.vis_counts) * 0.5 * max(self.last_size[0], self.last_size[1])
+                avg_grad_norm = (self.xys_grad_norm / self.vis_counts) * 0.5 * max(self.last_size[0], self.last_size[1])    # [N]
                 # self.config.densify_grad_thresh默认是0.0008
-                high_grads = (avg_grad_norm > self.config.densify_grad_thresh).squeeze()
+                high_grads = (avg_grad_norm > self.config.densify_grad_thresh).squeeze()    
                 # self.config.densify_size_thresh默认是0.01
                 splits = (self.scales.exp().max(dim=-1).values > self.config.densify_size_thresh).squeeze()
                 # self.config.stop_screen_size_at默认是4000
@@ -805,6 +1281,7 @@ class TSplatterModel(SplatfactoModel):
                 # 对高位置梯度且size比较小的高斯进行duplicate
                 dups &= high_grads
                 dup_params = self.dup_gaussians(dups)
+
                 for name, param in self.gauss_params.items():
                     self.gauss_params[name] = torch.nn.Parameter(
                         torch.cat([param.detach(), split_params[name], dup_params[name]], dim=0)

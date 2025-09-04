@@ -28,11 +28,11 @@ tsplatter = MethodSpecification(
             datamanager=TSplatterManagerConfig(
                 dataparser=ThermalMapDataParserConfig()
             ),
-            # model=TSplatterModelConfig(),
-            model=TSplatterModelConfig(
-                cull_alpha_thresh=0.005,
-                continue_cull_post_densification=False,
-            ),
+            model=TSplatterModelConfig(),
+            # model=TSplatterModelConfig(
+            #     cull_alpha_thresh=0.005,
+            #     continue_cull_post_densification=False,
+            # ),
         ),
         
         optimizers={

@@ -34,6 +34,7 @@ except ImportError:
     TENSORBOARD_FOUND = False
 import numpy as np
 import faiss
+from collections import deque
 import gc
 
 # from autoencoder.model import Autoencoder
@@ -207,37 +208,57 @@ def majority_voting(gaussians, scene, pipe, background, dataset, args):
     return averaged_tensor
 
 # 1. 聚类
-def cosine_similarity_clustering(features, threshold=0.8):
+def cosine_similarity_clustering(features, threshold=0.8, k=50, use_gpu=True):
     """
-    根据余弦相似度将高斯点进行聚类。
-    :param features: 形状为[N, 512]的tensor
-    :param threshold: 相似度阈值
-    :return: 每个高斯点的聚类索引
+    使用 FAISS + 近似最近邻实现大规模余弦相似度聚类。
+    
+    :param features: torch.Tensor, 形状 [N, D]
+    :param threshold: float, 相似度阈值
+    :param k: int, 每个点检索的近邻数量（越大越准，越慢）
+    :param use_gpu: bool, 是否使用GPU加速（如果可用）
+    :return: torch.LongTensor, 每个点的聚类标签
     """
-    N = features.shape[0]
+    N, D = features.shape
+    
+    # 转 numpy float32
+    feats = features.cpu().numpy().astype("float32")
+    
+    # 建立索引
+    index = faiss.IndexFlatIP(D)  # 内积索引
+    if use_gpu and faiss.get_num_gpus() > 0:
+        index = faiss.index_cpu_to_all_gpus(index)
 
-    # 初始化聚类标签
-    clusters = -1 * np.ones(N)  # 初始化所有点的聚类标签为-1
+    index.add(feats)
+
+    # 检索 k 个近邻
+    sims, idxs = index.search(feats, k)
+
+    # 图聚类（连通分量）
+    clusters = -1 * np.ones(N, dtype=int)
     cluster_id = 0
 
-    # 将输入的features移到CPU上
-    features_cpu = features.cpu().numpy()
-
-    # 遍历每一对高斯点并计算它们的余弦相似度
     for i in range(N):
-        if clusters[i] == -1:  # 如果当前点没有被分配到任何一个聚类
-            clusters[i] = cluster_id
-            for j in range(i + 1, N):
-                # 逐对计算余弦相似度
-                sim = cosine_similarity([features_cpu[i]], [features_cpu[j]])[0, 0]
-                if sim > threshold:  # 如果两个点的余弦相似度大于阈值
-                    clusters[j] = cluster_id  # 将其分到同一类
-            cluster_id += 1
-
-    return torch.tensor(clusters)
+        if clusters[i] != -1:
+            continue
+        # BFS / DFS 找到所有相连点
+        q = deque([i])
+        clusters[i] = cluster_id
+        while q:
+            node = q.popleft()
+            # 取出 node 的近邻
+            neighbors = idxs[node]
+            neighbor_sims = sims[node]
+            # 筛选相似度大于阈值的邻居
+            for sim, nb in zip(neighbor_sims, neighbors):
+                if sim > threshold and clusters[nb] == -1:
+                    clusters[nb] = cluster_id
+                    q.append(nb)
+        cluster_id += 1
+    
+    return torch.tensor(clusters, dtype=torch.long)
 
 # 2. KNN构建边赋权图
-def build_graph(gaussians, cluster_ids, k_neighbors=10):
+def build_graph(gaussians, cluster_ids, k_neighbors=5):
     """
     基于KNN构建边赋权图。
     :param gaussians: 高斯点数据，包含位置和球谐系数
@@ -248,13 +269,14 @@ def build_graph(gaussians, cluster_ids, k_neighbors=10):
     graphs = {}
     for cluster_id in torch.unique(cluster_ids):  # 对每个聚类进行处理
         indices = torch.where(cluster_ids == cluster_id)[0]  # 获取当前聚类的索引
-        positions = gaussians.get_xyz[indices]  # 当前聚类的高斯点位置
+        positions = gaussians.get_xyz[indices].cpu().numpy()  # 当前聚类的高斯点位置
         N = indices.shape[0]
 
         # 计算KNN
+        k_neighbors = min(k_neighbors, positions.shape[0])
         knn = NearestNeighbors(n_neighbors=k_neighbors, metric='euclidean')
-        knn.fit(positions.cpu().numpy())
-        distances, neighbors = knn.kneighbors(positions.cpu().numpy())
+        knn.fit(positions)
+        distances, neighbors = knn.kneighbors(positions)
         
         # 构建无向图的边
         edges = []

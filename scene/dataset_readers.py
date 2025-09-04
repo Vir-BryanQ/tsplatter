@@ -264,7 +264,6 @@ def readColmapSceneInfo(path, images, eval, llffhold=8, orientation_method="up",
             id=img.id, qvec=qvec, tvec=tvec,
             camera_id=img.camera_id, name=img.name,
             xys=img.xys, point3D_ids=img.point3D_ids)
-    print(cam_extrinsics[1].qvec, cam_extrinsics[1].tvec)
 
     reading_dir = "images_rgb" if images == None else images
     # cam_infos_unsorted是一个list
