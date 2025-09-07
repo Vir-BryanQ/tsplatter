@@ -7,6 +7,7 @@ from concurrent.futures import ThreadPoolExecutor
 from rich.progress import track
 from pathlib import Path
 import torchvision.utils as vutils
+import numpy as np
 
 import torch, gc
 import torch.nn.functional as F
@@ -147,7 +148,7 @@ class TSplatterModelConfig(SplatfactoModelConfig):
     warmup_length: int = 10
     """period of steps where refinement is turned off"""
     # refine_every: int = 100
-    refine_every: int = 5
+    refine_every: int = 10
     """period of steps where gaussians are culled and densified"""
     # resolution_schedule: int = 3000
     resolution_schedule: int = 150
@@ -228,6 +229,7 @@ class TSplatterModelConfig(SplatfactoModelConfig):
     disable_refinement: bool = False
     use_vanilla_sh: bool = False
     use_merge_sparsification: bool = True # disable_refinement should be False
+    stop_merge_at: int = 150
 
 class TSplatterModel(SplatfactoModel):
     config: TSplatterModelConfig
@@ -386,6 +388,13 @@ class TSplatterModel(SplatfactoModel):
     @property
     def thermal_features_rest(self):
         return self.gauss_params["thermal_features_rest"]
+
+    @property
+    def thermal_colors(self):
+        if self.config.sh_degree > 0:
+            return SH2RGB(self.thermal_features_dc)
+        else:
+            return torch.sigmoid(self.thermal_features_dc)
     
     def get_gaussian_param_groups(self) -> Dict[str, List[Parameter]]:
         # Here we explicitly use the means, scales as parameters so that the user can override this function and
@@ -619,7 +628,6 @@ class TSplatterModel(SplatfactoModel):
             "background": background,  # type: ignore
         }  # type: ignore
 
-    
     def get_loss_dict(self, outputs, batch, metrics_dict=None) -> Dict[str, torch.Tensor]:
         """Computes and returns the losses dict.
 
@@ -965,6 +973,9 @@ class TSplatterModel(SplatfactoModel):
     def decompose_covariance(self, Sigma):
         eigvals, eigvecs = torch.linalg.eigh(Sigma)  # [N,3], [N,3,3]
         scales = torch.sqrt(torch.clamp(eigvals, min=1e-8))
+        # 行列式为1的正交矩阵才是旋转矩阵，因此需要将eigvecs中所有行列式为-1的正交矩阵修正为 1
+        det = torch.det(eigvecs)  # [N]
+        eigvecs[det < 0, :, -1] *= -1
         q = self.rotmat_to_quat(eigvecs)
         return q, scales
 
@@ -1019,12 +1030,86 @@ class TSplatterModel(SplatfactoModel):
 
         return i_idx_new, j_idx_new
 
+    def rgb_to_lab(self, rgb: torch.Tensor) -> torch.Tensor:
+        # rgb: [N, 3], 取值 [0,1]
+        # 参考公式: sRGB -> XYZ -> Lab
+        
+        # sRGB gamma correction
+        mask = (rgb > 0.04045).float()
+        rgb_lin = (((rgb + 0.055) / 1.055) ** 2.4) * mask + (rgb / 12.92) * (1 - mask)
+        
+        # sRGB to XYZ (D65)
+        M = torch.tensor([[0.4124564, 0.3575761, 0.1804375],
+                        [0.2126729, 0.7151522, 0.0721750],
+                        [0.0193339, 0.1191920, 0.9503041]], 
+                        dtype=rgb.dtype, device=rgb.device)
+        xyz = rgb_lin @ M.T
+
+        # Normalize by reference white (D65)
+        xyz_ref = torch.tensor([0.95047, 1.00000, 1.08883], 
+                            dtype=rgb.dtype, device=rgb.device)
+        xyz = xyz / xyz_ref
+
+        # f(t) function
+        eps = 216/24389
+        kappa = 24389/27
+        mask = (xyz > eps).float()
+        f = xyz.pow(1/3) * mask + ((kappa * xyz + 16) / 116) * (1 - mask)
+
+        L = (116 * f[:,1] - 16).unsqueeze(1)
+        a = (500 * (f[:,0] - f[:,1])).unsqueeze(1)
+        b = (200 * (f[:,1] - f[:,2])).unsqueeze(1)
+
+        return torch.cat([L,a,b], dim=1)  # [N,3]
+
+    def lab_to_rgb(self, lab: torch.Tensor) -> torch.Tensor:
+        # lab: [N, 3]
+        # 参考公式: Lab -> XYZ -> sRGB
+
+        # 分离 L, a, b
+        L, a, b = lab[:, 0], lab[:, 1], lab[:, 2]
+
+        # 计算 f^-1(t)
+        eps = 216 / 24389
+        kappa = 24389 / 27
+
+        # 反 f(t) 函数
+        fy = (L + 16) / 116
+        fx = a / 500 + fy
+        fz = fy - b / 200
+
+        # 计算 XYZ 值
+        xyz = torch.stack([fx, fy, fz], dim=1)
+
+        # 逆操作：f^-1(t)
+        mask = (xyz > eps).float()
+        xyz = torch.where(mask == 1,
+                        (xyz ** 3),  # f^-1(t) = xyz^3
+                        (xyz - 16 / 116) * 24389 / 27)  # f^-1(t) = (xyz - 16/116) * kappa
+
+        # 恢复 XYZ (D65)
+        xyz_ref = torch.tensor([0.95047, 1.00000, 1.08883], dtype=lab.dtype, device=lab.device)
+        xyz = xyz * xyz_ref
+
+        # XYZ to sRGB
+        M_inv = torch.tensor([[3.2404542, -1.5371385, -0.4985314],
+                            [-0.9692660, 1.8760108, 0.0415560],
+                            [0.0556434, -0.2040259, 1.0572252]], 
+                            dtype=lab.dtype, device=lab.device)
+        rgb_lin = torch.matmul(xyz, M_inv.T)
+
+        # sRGB gamma correction
+        mask = (rgb_lin > 0.0031308).float()
+        rgb = ((rgb_lin ** (1 / 2.4)) * 1.055 - 0.055) * mask + (rgb_lin * 12.92) * (1 - mask)
+
+        # Clip RGB values to the range [0, 1]
+        rgb = torch.clamp(rgb, 0.0, 1.0)
+
+        rgb = torch.nan_to_num(rgb, nan=0.0)
+
+        return rgb  # [N, 3]
+
     def merge_params_blockwise(self, mu_i, mu_j, Sigma_i, Sigma_j, alpha_i, alpha_j, f_i, f_j, block_size=1000000):
-        """
-        分块计算新高斯参数，避免一次性占用过多显存。
-        输入: 各个张量形状 [num_pairs, ...]
-        输出: mu_new, Sigma_new, alpha_new, f_new
-        """
         num_pairs = mu_i.shape[0]
         device = mu_i.device
 
@@ -1087,7 +1172,7 @@ class TSplatterModel(SplatfactoModel):
 
         return mu_new, Sigma_new, alpha_new, f_new
 
-    def merge_gaussians(self, merge_mask, k=5, color_thresh=0.1, dist_thresh=2.38, sample_bound=5000):
+    def merge_gaussians(self, merge_mask, k=5, color_thresh=2.5, dist_thresh=2.38, block_size=80000):
         N = self.means.shape[0]
         device = self.means.device
 
@@ -1095,76 +1180,85 @@ class TSplatterModel(SplatfactoModel):
         quats = self.quats[merge_mask]
         scales = torch.exp(self.scales[merge_mask])
         opacities = torch.sigmoid(self.opacities[merge_mask]).squeeze(-1)
-        colors = self.thermal_features_dc[merge_mask]
+        colors = self.rgb_to_lab(self.thermal_colors[merge_mask])
 
         covs = self.get_covariance(quats, scales)     # [M,3,3]
+        inv_covs = torch.linalg.pinv(covs)            # [M,3,3]
         M = means.shape[0]
 
-        # -------- 采样 M1 个主动合并者 --------
-        M1 = min(M, sample_bound)
-        sampled_idx = torch.randperm(M, device=device)[:M1]  # [M1]
-        means_sampled = means[sampled_idx]
+        knn_idx_list = []
+        for start in range(0, M, block_size):
+            M1 = min(block_size, M - start)
+            end = start + M1
+            means_sampled = means[start:end]    # [M1, 3]
 
-        # -------- KNN 搜索 (欧式距离) --------
-        euclidean_dists = torch.cdist(means_sampled, means)   # [M1,M]
-        knn_idx = euclidean_dists.topk(k+1, largest=False).indices[:,1:]  # [M1,k]
+            # -------- KNN 搜索 (欧式距离) --------
+            euclidean_dists = torch.cdist(means_sampled, means)   # [M1,M]
+            # knn_idx = euclidean_dists.topk(k+1, largest=False).indices[:,1:]  存在数值精度问题
+            knn_idx = euclidean_dists.topk(k+1, largest=False).indices  # [M1,k+1]
+            knn_idx_list.append(knn_idx)
 
-        del euclidean_dists
-        gc.collect()
+            del euclidean_dists
+            gc.collect()
+
+        knn_idx = torch.cat(knn_idx_list, dim=0)    # [M,k+1]
 
         # -------- Mahalanobis 距离 --------
-        diff = means_sampled[:,None,:] - means[None,:,:]      # [M1,M,3]
-        inv_covs = torch.linalg.pinv(covs)                    # [M,3,3]
+        means_k = means[knn_idx]    # [M,k+1,3]
+        diff = means[:,None,:] - means_k      # [M,k+1,3]
 
         # d_ij: 使用 j 的协方差
-        d_ij = torch.einsum('imj,mjk,imk->im', diff, inv_covs, diff)
+        inv_covs_k = inv_covs[knn_idx] # [M, k+1, 3, 3]
+        temp = torch.matmul(diff.unsqueeze(-2), inv_covs_k) # [M, k+1, 1, 3]
+        d_ij = torch.matmul(temp, diff.unsqueeze(-1)).squeeze()   # [M, k+1]
 
         # d_ji: 使用 i 的协方差
-        inv_covs_i = inv_covs[sampled_idx]                  # [M1,3,3]
-        d_ji = torch.einsum('imj,ijk,imk->im', diff, inv_covs_i, diff)
-
-        del diff
-        gc.collect()
+        temp = torch.matmul(diff.unsqueeze(-2), inv_covs.unsqueeze(1).repeat(1, k+1, 1, 1)) # [M, k+1, 1, 3]
+        d_ji = torch.matmul(temp, diff.unsqueeze(-1)).squeeze() # [M, k+1]
 
         d_ij = torch.clamp(d_ij, min=1e-8)
         d_ji = torch.clamp(d_ji, min=1e-8)
 
         # 取对称化距离
-        d_m = torch.max(d_ij, d_ji) # [M1,M]
-
-        del d_ij, d_ji
-        gc.collect()
+        d_m = torch.max(d_ij, d_ji) # [M, k+1]
 
         # -------- 颜色距离 --------
-        color_diff = torch.cdist(means_sampled, means, p=1) # [M1,M]
+        colors_k = colors[knn_idx]     # [M, k+1, 3]
+        color_diff = torch.norm(colors[:,None,:] - colors_k, dim=-1)  # [M, k+1]
 
-        # -------- 条件过滤 (限制在 knn 内) --------
-        valid_mask = (d_m < dist_thresh) & (color_diff < color_thresh)
+        valid_mask = (d_m < dist_thresh) & (color_diff < color_thresh)  # [M, k+1]
 
-        del color_diff, d_m
-        gc.collect()
-
-        knn_mask = torch.zeros_like(valid_mask, dtype=torch.bool)  # [M1,M]
-        knn_mask.scatter_(1, knn_idx, True)
-        pair_mask = valid_mask & knn_mask
-
-        del valid_mask, knn_mask
-        gc.collect()
-
-        i_idx, j_idx = torch.where(pair_mask)  # i in [M1], j in [M]
-        i_idx, j_idx = self.unique_pairs(i_idx, j_idx, M1=pair_mask.size(0), M=pair_mask.size(1))
-
-        del pair_mask
-        gc.collect()
+        i_idx, j_idx = torch.where(valid_mask)  # i in [M], j in [k+1]
 
         if i_idx.numel() == 0:
             return None, torch.zeros(N, dtype=torch.bool, device=device)
 
-        # -------- 合并计算 (批量) --------
-        mu_i, mu_j = means_sampled[i_idx], means[j_idx]
-        Sigma_i, Sigma_j = covs[sampled_idx[i_idx]], covs[j_idx]
-        alpha_i, alpha_j = opacities[sampled_idx[i_idx]], opacities[j_idx]
-        f_i, f_j = colors[sampled_idx[i_idx]], colors[j_idx]
+        j_idx = knn_idx[i_idx, j_idx]   # j in [M]
+
+        i_idx = i_idx.cpu().numpy()
+        j_idx = j_idx.cpu().numpy()
+        i_list = []
+        j_list = []
+        used_idx = np.zeros(max(i_idx.max(), j_idx.max()) + 1, dtype=bool)
+        for i in range(0, i_idx.shape[0]):
+            if i_idx[i] == j_idx[i]:
+                continue
+            if used_idx[i_idx[i]] or used_idx[j_idx[i]]:
+                continue
+            used_idx[i_idx[i]] = used_idx[j_idx[i]] = True
+            i_list.append(i_idx[i])
+            j_list.append(j_idx[i])
+
+        i_idx = torch.tensor(i_list).cuda()
+        j_idx = torch.tensor(j_list).cuda()
+
+        if i_idx.numel() == 0:
+            return None, torch.zeros(N, dtype=torch.bool, device=device)
+
+        mu_i, mu_j = means[i_idx], means[j_idx]
+        Sigma_i, Sigma_j = covs[i_idx], covs[j_idx]
+        alpha_i, alpha_j = opacities[i_idx], opacities[j_idx]
+        f_i, f_j = colors[i_idx], colors[j_idx]
 
         mu_new, Sigma_new, alpha_new, f_new = self.merge_params_blockwise(
             mu_i, mu_j, Sigma_i, Sigma_j, alpha_i, alpha_j, f_i, f_j
@@ -1174,11 +1268,12 @@ class TSplatterModel(SplatfactoModel):
 
         out = {
             "means": mu_new,
-            "thermal_features_dc": f_new,
-            "opacities": torch.logit(alpha_new).unsqueeze(1),
+            "thermal_features_dc": torch.logit(self.lab_to_rgb(f_new), eps=1e-10),
+            "opacities": torch.logit(alpha_new, eps=1e-10).unsqueeze(1),
             "scales": torch.log(s_new),
             "quats": q_new,
         }
+
         for name, param in self.gauss_params.items():
             if name not in out:
                 # p_i, p_j = param[sampled_idx[i_idx]], param[j_idx]   # [num_pairs,...]
@@ -1187,12 +1282,12 @@ class TSplatterModel(SplatfactoModel):
                 # denom = alpha_sum.view(-1, *([1] * (p_i.ndim - 1)))
                 # p_new = (weight_i * p_i + weight_j * p_j) / denom
                 # out[name] = p_new
-                shape = (mu_i.shape[0],) + param.shape[1:]
+                shape = (mu_new.shape[0],) + param.shape[1:]
                 out[name] = torch.zeros(shape, device=param.device, dtype=param.dtype)
 
-        merged_mask = torch.zeros(N + mu_i.shape[0], dtype=torch.bool, device=device)
+        merged_mask = torch.zeros(N + mu_new.shape[0], dtype=torch.bool, device=device)
         idx_map = merge_mask.nonzero(as_tuple=True)[0]  # [M]
-        merged_mask[idx_map[sampled_idx[i_idx]]] = True
+        merged_mask[idx_map[i_idx]] = True
         merged_mask[idx_map[j_idx]] = True
 
         return out, merged_mask
@@ -1201,7 +1296,7 @@ class TSplatterModel(SplatfactoModel):
         if self.config.disable_refinement:
             return 
 
-        if self.step <= self.config.warmup_length:
+        if self.step <= self.config.warmup_length or self.step > self.config.stop_merge_at:
             # 训练开始阶段不进行refinement
             return
 
