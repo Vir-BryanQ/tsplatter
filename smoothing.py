@@ -96,7 +96,7 @@ def majority_voting(gaussians, scene, pipe, background, dataset, args):
     
     #### code edit ####
     # 对feature进行计数
-    num_masks_array = torch.zeros(len(viewpoint_stack), dtype=torch.int)
+    num_masks_array = torch.zeros(len(viewpoint_stack), dtype=torch.int, device=gaussians.get_opacity.device)
     for i in range(len(viewpoint_stack)):
         language_feature_name = os.path.join(lf_path, viewpoint_stack[i].image_name)
         feature_map = torch.from_numpy(np.load(language_feature_name + '_f.npy'))   # [B,D]
@@ -104,8 +104,8 @@ def majority_voting(gaussians, scene, pipe, background, dataset, args):
 
     num_masks = torch.sum(num_masks_array)  # 所有图像的feature总数 M
     num_gaussians = len(gaussians.get_opacity)
-    features_array = torch.zeros((num_masks,512))   # [M,512]
-    allocate_array = torch.zeros((num_gaussians, num_masks), dtype=torch.float32)   # [N,M]
+    features_array = torch.zeros((num_masks,512), device=gaussians.get_opacity.device)   # [M,512]
+    allocate_array = torch.zeros((num_gaussians, num_masks), dtype=torch.float32, device=gaussians.get_opacity.device)   # [N,M]
     offset = 0
     for i in tqdm(range(len(viewpoint_stack))):
         viewpoint_cam = viewpoint_stack[i]
@@ -123,7 +123,7 @@ def majority_voting(gaussians, scene, pipe, background, dataset, args):
         # self._feature_level = -1
         # ParamGroup中对下划线进行了处理
         # # 0:default 1:s 2:m 3:l
-        seg_map = torch.from_numpy(np.load(language_feature_name + '_s.npy')).type(torch.int64)[dataset.feature_level].unsqueeze(0) # [1,H,W]
+        seg_map = torch.from_numpy(np.load(language_feature_name + '_s.npy')).type(torch.int64)[dataset.feature_level].unsqueeze(0).cuda() # [1,H,W]
         seg_map_bool = seg_map != -1    # bool [1,H,W]
         seg_map += offset   # 保证seg_map中的索引与features_array一致
 
@@ -151,12 +151,9 @@ def majority_voting(gaussians, scene, pipe, background, dataset, args):
         valid_mask = (ray_ids != -1)    # -1索引为无效索引
         ray_ids = ray_ids[valid_mask]
         weights = weights[valid_mask]
-        gt_segmentations = gt_segmentations[valid_mask.cpu()]
+        gt_segmentations = gt_segmentations[valid_mask]
 
-        # 设备和类型转换
-        weights = weights.cpu()
-        ray_ids = ray_ids.cpu().type(torch.int64)
-        valid_mask = valid_mask.cpu()
+        ray_ids = ray_ids.type(torch.int64)
 
         # weight_sum = torch.zeros(num_gaussians)
         # 以下划线结尾代表原地操作
@@ -204,58 +201,33 @@ def majority_voting(gaussians, scene, pipe, background, dataset, args):
     #     averaged_tensor = torch.ByteTensor(averaged_tensor).to("cuda")
     #     averaged_tensor[invalid_gaussians,:] = -1
         
-
     return averaged_tensor
 
 # 1. 聚类
-def cosine_similarity_clustering(features, threshold=0.8, k=50, use_gpu=True):
-    """
-    使用 FAISS + 近似最近邻实现大规模余弦相似度聚类。
-    
-    :param features: torch.Tensor, 形状 [N, D]
-    :param threshold: float, 相似度阈值
-    :param k: int, 每个点检索的近邻数量（越大越准，越慢）
-    :param use_gpu: bool, 是否使用GPU加速（如果可用）
-    :return: torch.LongTensor, 每个点的聚类标签
-    """
-    N, D = features.shape
-    
-    # 转 numpy float32
-    feats = features.cpu().numpy().astype("float32")
-    
-    # 建立索引
-    index = faiss.IndexFlatIP(D)  # 内积索引
-    if use_gpu and faiss.get_num_gpus() > 0:
-        index = faiss.index_cpu_to_all_gpus(index)
+def cosine_similarity_clustering(features, threshold=0.8, block_size=50000):
 
-    index.add(feats)
-
-    # 检索 k 个近邻
-    sims, idxs = index.search(feats, k)
-
-    # 图聚类（连通分量）
-    clusters = -1 * np.ones(N, dtype=int)
+    N = features.shape[0]
+    device = features.device
+    free_mask = torch.ones(N, dtype=torch.bool, device=device) # [N]
+    cluster_ids = -1 * torch.ones(N, dtype=torch.int, device=device)    # [N]
     cluster_id = 0
+    for start in range(0, N, block_size):
+        N1 = min(block_size, N - start)
+        end = start + N1
+        features_sampled = features[start:end]    # [N1, D]
+        sim_mask = (features_sampled @ features.T) > threshold   # [N1, N]
+        s = sim_mask
+        while s.shape[0] > 0:
+            grp_mask = s[0] & free_mask     # [N]
+            cluster_ids[grp_mask] = cluster_id
+            free_mask[grp_mask] = False
+            cluster_id += 1
+            s = sim_mask[free_mask[start:end]]
+        del sim_mask
+        gc.collect()
 
-    for i in range(N):
-        if clusters[i] != -1:
-            continue
-        # BFS / DFS 找到所有相连点
-        q = deque([i])
-        clusters[i] = cluster_id
-        while q:
-            node = q.popleft()
-            # 取出 node 的近邻
-            neighbors = idxs[node]
-            neighbor_sims = sims[node]
-            # 筛选相似度大于阈值的邻居
-            for sim, nb in zip(neighbor_sims, neighbors):
-                if sim > threshold and clusters[nb] == -1:
-                    clusters[nb] = cluster_id
-                    q.append(nb)
-        cluster_id += 1
-    
-    return torch.tensor(clusters, dtype=torch.long)
+    return cluster_ids
+        
 
 # 2. KNN构建边赋权图
 def build_graph(gaussians, cluster_ids, k_neighbors=5):
@@ -437,7 +409,17 @@ def smoothing(dataset, opt, pipe, checkpoint, args):
     background = torch.tensor(bg_color, dtype=torch.float32, device="cuda") 
     
     maj_feat = majority_voting(gaussians, scene, pipe, background, dataset, args)
-    gaussians._language_feature = maj_feat
+    # 删除feature为零向量的高斯
+    gaussians_mask = maj_feat.norm(dim=-1) > 0  # [N]
+    gaussians._language_feature = maj_feat[gaussians_mask]
+    gaussians._xyz = gaussians._xyz[gaussians_mask]
+    gaussians._features_dc = gaussians._features_dc[gaussians_mask]
+    gaussians._features_rest = gaussians._features_rest[gaussians_mask]
+    gaussians._thermal_features_dc = gaussians._thermal_features_dc[gaussians_mask]
+    gaussians._thermal_features_rest = gaussians._thermal_features_rest[gaussians_mask]
+    gaussians._scaling = gaussians._scaling[gaussians_mask]
+    gaussians._rotation = gaussians._rotation[gaussians_mask]
+    gaussians._opacity = gaussians._opacity[gaussians_mask]
 
     thermal_features = temperature_propagation(gaussians, scene, pipe, background, dataset, args)
     gaussians._thermal_features_dc = thermal_features[:, 0, :]
@@ -445,6 +427,12 @@ def smoothing(dataset, opt, pipe, checkpoint, args):
 
     ckpt["pipeline"]["_model.gauss_params.thermal_features_dc"] = gaussians._thermal_features_dc.cpu()
     ckpt["pipeline"]["_model.gauss_params.thermal_features_rest"] = gaussians._thermal_features_rest.cpu()
+    ckpt["pipeline"]["_model.gauss_params.means"] = ckpt["pipeline"]["_model.gauss_params.means"][gaussians_mask]
+    ckpt["pipeline"]["_model.gauss_params.scales"] = ckpt["pipeline"]["_model.gauss_params.scales"][gaussians_mask]
+    ckpt["pipeline"]["_model.gauss_params.quats"] = ckpt["pipeline"]["_model.gauss_params.quats"][gaussians_mask]
+    ckpt["pipeline"]["_model.gauss_params.opacities"] = ckpt["pipeline"]["_model.gauss_params.opacities"][gaussians_mask]
+    ckpt["pipeline"]["_model.gauss_params.features_dc"] = ckpt["pipeline"]["_model.gauss_params.features_dc"][gaussians_mask]
+    ckpt["pipeline"]["_model.gauss_params.features_rest"] = ckpt["pipeline"]["_model.gauss_params.features_rest"][gaussians_mask]
     base_name, ext = os.path.splitext(checkpoint)
     new_checkpoint = base_name + "_origin" + ext
     os.rename(checkpoint, new_checkpoint)
@@ -572,6 +560,7 @@ if __name__ == "__main__":
     #     lp._language_features_name = "language_features_pq"
 
     safe_state(args.quiet)
+    torch.set_grad_enabled(False)
 
     # 在 PyTorch 中，autograd 会记录运算过程并自动求导。有时候在反向传播（loss.backward()）时，会遇到 NaN、inf 或非法操作，但报错信息并不会直接告诉你是在哪个算子里出的问题，调试起来很麻烦
     # 调用 torch.autograd.set_detect_anomaly(True) 后，PyTorch 会在反向传播时逐步检查每个算子 的梯度计算，一旦发现 NaN 或 inf，就会立刻报错，并指出具体是在哪个算子里出现的异常
