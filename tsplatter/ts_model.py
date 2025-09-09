@@ -979,57 +979,6 @@ class TSplatterModel(SplatfactoModel):
         q = self.rotmat_to_quat(eigvecs)
         return q, scales
 
-    def unique_pairs(self, i_idx, j_idx, M1, M):
-        """
-        从候选对 (i_idx, j_idx) 中筛选唯一配对，
-        保证每个 i ∈ [0, M1) 和每个 j ∈ [0, M) 最多只出现一次。
-
-        参数:
-            i_idx: LongTensor [P]  (候选对中的 i 索引)
-            j_idx: LongTensor [P]  (候选对中的 j 索引)
-            M1: int (i 的最大范围，通常 = pair_mask.size(0))
-            M: int (j 的最大范围，通常 = pair_mask.size(1))
-
-        返回:
-            i_idx_new: LongTensor [Q]
-            j_idx_new: LongTensor [Q]
-        """
-        device = i_idx.device
-        P = i_idx.size(0)
-
-        if P == 0:
-            return i_idx, j_idx  # 空输入直接返回
-
-        # step1: 生成全局顺序 (保证 pair 唯一)
-        order = torch.arange(P, device=device)
-        # 这里可以自定义排序规则，比如按 i 再按 j
-        # order = torch.argsort(i_idx * M + j_idx)
-
-        i_idx = i_idx[order]
-        j_idx = j_idx[order]
-
-        # step2: 记录每个 i 第一次出现的位置
-        pos_i = torch.full((M1,), P, dtype=torch.long, device=device)
-        rev = torch.arange(P - 1, -1, -1, device=device)  # 倒序
-        pos_i.scatter_(0, i_idx[rev], rev)  # 保留最小下标
-        first_i = pos_i[pos_i < P]
-
-        # step3: 记录每个 j 第一次出现的位置
-        pos_j = torch.full((M,), P, dtype=torch.long, device=device)
-        pos_j.scatter_(0, j_idx[rev], rev)
-        first_j = pos_j[pos_j < P]
-
-        # step4: 构造布尔掩码
-        mask = torch.zeros(P, dtype=torch.bool, device=device)
-        mask[first_i] = True
-        mask[first_j] = mask[first_j] & True  # 保证 i/j 都唯一
-
-        # step5: 筛选
-        i_idx_new = i_idx[mask]
-        j_idx_new = j_idx[mask]
-
-        return i_idx_new, j_idx_new
-
     def rgb_to_lab(self, rgb: torch.Tensor) -> torch.Tensor:
         # rgb: [N, 3], 取值 [0,1]
         # 参考公式: sRGB -> XYZ -> Lab
@@ -1183,7 +1132,8 @@ class TSplatterModel(SplatfactoModel):
         colors = self.rgb_to_lab(self.thermal_colors[merge_mask])
 
         covs = self.get_covariance(quats, scales)     # [M,3,3]
-        inv_covs = torch.linalg.pinv(covs)            # [M,3,3]
+        # inv_covs = torch.linalg.pinv(covs)            # [M,3,3]
+        inv_covs = torch.linalg.inv(covs)            # [M,3,3]
         M = means.shape[0]
 
         knn_idx_list = []

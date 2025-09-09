@@ -14,6 +14,7 @@ os.environ["MKL_NUM_THREADS"] = "12"
 os.environ["NUMEXPR_NUM_THREADS"] = "12"
 os.environ["OMP_NUM_THREADS"] = "12"
 import torch
+from torch_scatter import scatter_max
 import torch.nn.functional as F
 from PIL import Image
 from random import randint
@@ -203,8 +204,7 @@ def majority_voting(gaussians, scene, pipe, background, dataset, args):
         
     return averaged_tensor
 
-# 1. 聚类
-def cosine_similarity_clustering(features, threshold=0.8, block_size=50000):
+def cosine_similarity_clustering(features, threshold=0.9, block_size=50000):
 
     N = features.shape[0]
     device = features.device
@@ -228,126 +228,99 @@ def cosine_similarity_clustering(features, threshold=0.8, block_size=50000):
 
     return cluster_ids
         
-
-# 2. KNN构建边赋权图
-def build_graph(gaussians, cluster_ids, k_neighbors=5):
-    """
-    基于KNN构建边赋权图。
-    :param gaussians: 高斯点数据，包含位置和球谐系数
-    :param cluster_ids: 聚类结果，每个高斯点的聚类标签
-    :param k_neighbors: KNN的邻居数量
-    :return: 每个组的图
-    """
-    graphs = {}
-    for cluster_id in torch.unique(cluster_ids):  # 对每个聚类进行处理
-        indices = torch.where(cluster_ids == cluster_id)[0]  # 获取当前聚类的索引
-        positions = gaussians.get_xyz[indices].cpu().numpy()  # 当前聚类的高斯点位置
-        N = indices.shape[0]
-
-        # 计算KNN
-        k_neighbors = min(k_neighbors, positions.shape[0])
-        knn = NearestNeighbors(n_neighbors=k_neighbors, metric='euclidean')
-        knn.fit(positions)
-        distances, neighbors = knn.kneighbors(positions)
-        
-        # 构建无向图的边
-        edges = []
-        weights = []
-        for i in range(N):
-            for j in range(1, k_neighbors):  # 跳过自己
-                neighbor_idx = neighbors[i, j]
-                dist = distances[i, j]
-                weight = 1.0 / (dist + 1e-6)  # 使用欧氏距离的倒数作为边的权值
-                edges.append((indices[i].item(), indices[neighbor_idx].item()))
-                weights.append(weight)
-        
-        # 将边和权值存储到字典中
-        graphs[cluster_id.item()] = {'edges': edges, 'weights': weights}
+def compute_significant_mask(contribution, ids, N, max_threshold=0.01, block_size=10000, use_max_weight=True, sum_threshold=0.25):
+    device = contribution.device
+    if use_max_weight:
+        per_gauss_contrib = torch.zeros(N, device=device, dtype=contribution.dtype)  # [N]
+        contribution = contribution.reshape(-1)   # [M*H*W*L]
+        ids = ids.reshape(-1)    # [M*H*W*L]
+        valid_mask = (ids != -1)    # [M*H*W*L]
+        contribution = contribution[valid_mask]
+        ids = ids[valid_mask]
+        out = scatter_max(contribution, ids.type(torch.long))[0]
+        per_gauss_contrib[:out.shape[0]] = out
+        significant_mask = per_gauss_contrib > max_threshold  # [N]
+    else:
+        per_gauss_contrib = torch.zeros(N, device=device, dtype=contribution.dtype)  # [N]
+        contribution = contribution.reshape(-1)   # [M*H*W*L]
+        ids = ids.reshape(-1)    # [M*H*W*L]
+        valid_mask = (ids != -1)    # [M*H*W*L]
+        contribution = contribution[valid_mask]
+        ids = ids[valid_mask]
+        per_gauss_contrib.index_put_((ids,), contribution, accumulate=True)
+        significant_mask = per_gauss_contrib > sum_threshold  # [N]
     
-    return graphs
+    return significant_mask
 
-def compute_significant_nodes(contribution, ids, N, threshold=0.2):
-    """
-    计算显著和非显著节点。
-    :param contribution: 形状为[M, H, W, 100]的张量，表示每个视角下每个像素对高斯点的贡献
-    :param ids: 形状为[M, H, W, 100]的张量，表示每个视角下每个像素上贡献的高斯点的索引
-    :param N: 高斯点的数量
-    :param threshold: 显著节点的贡献阈值
-    :return: 显著节点的索引集合
-    """
-    # 初始化一个形状为[N, M, H, W]的张量，用来记录每个高斯点对每个视角、每个像素的贡献
-    gauss_contrib = torch.zeros(N, contribution.shape[0], contribution.shape[1], contribution.shape[2])
-
-    # 填充gauss_contrib张量
-    for m in range(contribution.shape[0]):  # 遍历每个视角
-        for h in range(contribution.shape[1]):  # 遍历每个像素的高度
-            for w in range(contribution.shape[2]):  # 遍历每个像素的宽度
-                # 获取当前像素的所有高斯点索引（最多100个）
-                pixel_ids = ids[m, h, w]
-                for idx in range(contribution.shape[3]):
-                    gauss_idx = pixel_ids[idx].item()
-                    if gauss_idx != -1:  # 如果该位置有有效的高斯点
-                        gauss_contrib[gauss_idx, m, h, w] = contribution[m, h, w, idx]  # 更新该高斯点的贡献值
-
-    # 对每个高斯点，计算其在所有视角和所有像素的最大贡献值
-    max_contrib_per_gauss = torch.max(gauss_contrib.view(N, -1), dim=1)[0]  # 对每个高斯点，找到最大贡献值
-
-    # 判断显著节点
-    significant_nodes = torch.where(max_contrib_per_gauss > threshold)[0].tolist()
-
-    return significant_nodes
-
-def laplacian_smoothing(graphs, gaussians, significant_nodes, lambda_reg=0.5):
-    """
-    使用图拉普拉斯平滑计算非显著节点的球谐系数。
-    :param graphs: 每个聚类的图，包含edges和weights
-    :param gaussians: 高斯点数据，包含位置和球谐系数
-    :param significant_nodes: 显著节点的索引集合
-    :param lambda_reg: 拉普拉斯平滑的正则化系数
-    :return: 平滑后的球谐系数
-    """
+def laplacian_smoothing(gaussians, cluster_ids, full_significant_mask, lambda_reg=0.5, k_neighbors=5):
     N = gaussians.get_thermal_features.shape[0]
-    
-    # 初始化球谐系数，显著节点的球谐系数已经给定
+    device = gaussians.get_thermal_features.device
     thermal_features = gaussians.get_thermal_features.clone()   # [N,K,3]
-    
-    # 创建一个邻接矩阵
-    adj_matrix = torch.zeros((N, N))  # 邻接矩阵
-    for cluster_id, graph in graphs.items():
-        edges = graph['edges']
-        weights = graph['weights']
-        
-        for edge, weight in zip(edges, weights):
-            i, j = edge
-            adj_matrix[i, j] = weight
-            adj_matrix[j, i] = weight  # 无向图，保证对称性
 
-    # 计算度矩阵D
-    degree_matrix = torch.diag(adj_matrix.sum(dim=1))
+    unique_cluster_ids = torch.unique(cluster_ids).cpu()
+    for cluster_id in unique_cluster_ids:
+        indices = torch.where(cluster_ids == cluster_id)[0] # [M]
+        means = gaussians.get_xyz[indices]  # [M]
+        M = means.shape[0]
+        k = min(M - 1, k_neighbors)
 
-    # 计算拉普拉斯矩阵L = D - A
-    laplacian_matrix = degree_matrix - adj_matrix
-    
-    # 初始化显著和非显著节点
-    significant_nodes = set(significant_nodes)
-    non_significant_nodes = set(range(N)) - significant_nodes
-    
-    # 将显著节点的球谐系数视为已知，非显著节点的球谐系数视为未知
-    known_features = thermal_features[list(significant_nodes)]  # [N1,K,3]
-    
-    # 构造分块矩阵
-    L_ii = laplacian_matrix[list(non_significant_nodes), :][:, list(non_significant_nodes)]  # 非显著节点部分
-    L_ij = laplacian_matrix[list(non_significant_nodes), :][:, list(significant_nodes)]  # 非显著节点和显著节点之间的部分
-    
-    # 对于非显著节点，使用图拉普拉斯平滑
-    # 目标是解决方程: L_ii * unknown_features = -L_ij * known_features
-    rhs = -torch.mm(L_ij, known_features)  # 右侧项
-    smooth_unknown_features = torch.linalg.solve(L_ii + lambda_reg * torch.eye(L_ii.shape[0]), rhs)
-    
-    # 更新球谐系数
-    thermal_features[list(non_significant_nodes)] = smooth_unknown_features # [N2,K,3]
-    
+        euclidean_dists = torch.cdist(means, means)   # [M,M]
+        knn_idx = euclidean_dists.topk(k + 1, largest=False).indices   # [M,k+1]
+        weights = 1 / (euclidean_dists + 1e-9)  # [M,M]  
+        del euclidean_dists
+        gc.collect()
+
+        graph_mask = torch.zeros((M, M), device=device, dtype=torch.bool)     # [M,M]
+        graph_mask.scatter_(1, knn_idx, True)
+        graph_mask = graph_mask | graph_mask.T  # [M,M]
+
+        graph_mask.fill_diagonal_(0)
+        adj_matrix = torch.zeros((M, M), device=device, dtype=torch.float32)     # [M,M]
+        adj_matrix[graph_mask] = weights[graph_mask]
+        del weights, graph_mask
+        gc.collect()
+
+        degree_matrix = torch.diag(adj_matrix.sum(dim=1))
+        laplacian_matrix = degree_matrix - adj_matrix
+        del degree_matrix, adj_matrix
+        gc.collect()
+
+        significant_mask = full_significant_mask[indices]    # [M]
+
+        non_significant_mask = ~significant_mask    # [M]
+        L_ii = laplacian_matrix[non_significant_mask, :][:, non_significant_mask]  # [M2,M2]
+        L_ij = laplacian_matrix[non_significant_mask, :][:, significant_mask]  # [M2,M1]
+        del laplacian_matrix
+        gc.collect()
+
+        known_features = thermal_features[indices][significant_mask]  # [M1,K,3]
+        M1 = known_features.shape[0]
+        if M1 == 0:
+            print('Warning: there is no known feature in a group')
+            continue
+        M2 = M - M1
+        K = known_features.shape[1]
+        known_features = known_features.reshape(M1, -1) # [M1,K*3]
+
+        # 对于非显著节点，使用图拉普拉斯平滑
+        # 目标是解决方程: L_ii * unknown_features = -L_ij * known_features
+        rhs = -torch.mm(L_ij, known_features)  # [M2,K*3]
+        lhs = L_ii + lambda_reg * torch.eye(L_ii.shape[0], device=device)   # [M2,M2]
+
+        try:
+            smooth_unknown_features = torch.linalg.solve(lhs, rhs).reshape(M2, K, 3)    # [M2,K*3] -> [M2,K,3]
+        except torch.linalg.LinAlgError:
+            print('Warning: the input matrix is singular')
+            smooth_unknown_features = torch.linalg.lstsq(lhs, rhs)[0].reshape(M2, K, 3)
+
+        del L_ii, L_ij
+        gc.collect()
+
+        thermal_features[indices][non_significant_mask] = smooth_unknown_features
+
+    sye.exit(0)
     return thermal_features
+
 
 def temperature_propagation(gaussians, scene, pipe, background, dataset, args):
     num_gaussians = len(gaussians.get_opacity)
@@ -368,9 +341,10 @@ def temperature_propagation(gaussians, scene, pipe, background, dataset, args):
     contribution_stack = torch.stack(contribution_list, dim=0) # [M,H,W,100]
 
     cluster_ids = cosine_similarity_clustering(gaussians.get_language_feature)
-    graphs = build_graph(gaussians, cluster_ids)
-    significant_nodes = compute_significant_nodes(contribution_stack, ids_stack, num_gaussians)
-    thermal_features = laplacian_smoothing(graphs, gaussians, significant_nodes)
+    significant_mask = compute_significant_mask(contribution_stack, ids_stack, num_gaussians)
+    thermal_features = laplacian_smoothing(gaussians, cluster_ids, significant_mask)
+
+    print('temperature_propagation finished')
 
     return thermal_features
     
@@ -425,6 +399,7 @@ def smoothing(dataset, opt, pipe, checkpoint, args):
     gaussians._thermal_features_dc = thermal_features[:, 0, :]
     gaussians._thermal_features_rest = thermal_features[:, 1:, :]
 
+    gaussians_mask = gaussians_mask.cpu()
     ckpt["pipeline"]["_model.gauss_params.thermal_features_dc"] = gaussians._thermal_features_dc.cpu()
     ckpt["pipeline"]["_model.gauss_params.thermal_features_rest"] = gaussians._thermal_features_rest.cpu()
     ckpt["pipeline"]["_model.gauss_params.means"] = ckpt["pipeline"]["_model.gauss_params.means"][gaussians_mask]
