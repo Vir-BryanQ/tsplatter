@@ -37,12 +37,14 @@ import numpy as np
 import faiss
 from collections import deque
 import gc
+import umap
+import matplotlib.pyplot as plt
+import shutil
 
 # from autoencoder.model import Autoencoder
 
 from sklearn.metrics.pairwise import cosine_similarity
 from sklearn.neighbors import NearestNeighbors
-
 
 def update_voting_mat(result_dict, language_feature_mask, gt_language_feature, contribution, ids, args):
     # Select only locations where Mask is True
@@ -73,10 +75,123 @@ def update_voting_mat(result_dict, language_feature_mask, gt_language_feature, c
     return result_dict
 
 def compute_average(features):
-    averaged_tensor = features.mean(dim=0).unsqueeze(0)  # 평균 계산
+    averaged_tensor = features.mean(dim=0).unsqueeze(0)  
     averaged_tensor = averaged_tensor / (averaged_tensor.norm(dim=-1, keepdim=True) + 1e-9)
     return averaged_tensor
 
+def visualize_features(features):
+    features_np = features.cpu().numpy()
+
+    # 使用UMAP进行降维，降到2维
+    umap_model = umap.UMAP(
+        n_neighbors=15,        # 设置邻居数，根据数据集调整
+        min_dist=0.1,          # 设置最小距离，控制聚簇的紧密度
+        metric='cosine',       # 使用余弦相似度作为度量
+        n_components=2         # 降维到 2D 以便可视化
+    )
+    reduced_features = umap_model.fit_transform(features_np)
+
+    plt.figure(figsize=(8, 6))
+    plt.scatter(reduced_features[:, 0], reduced_features[:, 1], s=0.01, c='blue', alpha=0.5)
+    plt.title("UMAP Visualization of Feature Embeddings")
+    plt.xlabel("UMAP Dimension 1")
+    plt.ylabel("UMAP Dimension 2")
+    plt.grid(True)
+    plt.savefig('umap_visualization.png', dpi=300) 
+    plt.close()
+
+def rgb_to_lab(rgb: torch.Tensor) -> torch.Tensor:
+    # rgb: [N, 3], 取值 [0,1]
+    # 参考公式: sRGB -> XYZ -> Lab
+    
+    # sRGB gamma correction
+    mask = (rgb > 0.04045).float()
+    rgb_lin = (((rgb + 0.055) / 1.055) ** 2.4) * mask + (rgb / 12.92) * (1 - mask)
+    
+    # sRGB to XYZ (D65)
+    M = torch.tensor([[0.4124564, 0.3575761, 0.1804375],
+                    [0.2126729, 0.7151522, 0.0721750],
+                    [0.0193339, 0.1191920, 0.9503041]], 
+                    dtype=rgb.dtype, device=rgb.device)
+    xyz = rgb_lin @ M.T
+
+    # Normalize by reference white (D65)
+    xyz_ref = torch.tensor([0.95047, 1.00000, 1.08883], 
+                        dtype=rgb.dtype, device=rgb.device)
+    xyz = xyz / xyz_ref
+
+    # f(t) function
+    eps = 216/24389
+    kappa = 24389/27
+    mask = (xyz > eps).float()
+    f = xyz.pow(1/3) * mask + ((kappa * xyz + 16) / 116) * (1 - mask)
+
+    L = (116 * f[:,1] - 16).unsqueeze(1)
+    a = (500 * (f[:,0] - f[:,1])).unsqueeze(1)
+    b = (200 * (f[:,1] - f[:,2])).unsqueeze(1)
+
+    return torch.cat([L,a,b], dim=1)  # [N,3]
+
+def lab_to_rgb(lab: torch.Tensor) -> torch.Tensor:
+    # lab: [N, 3]
+    # 参考公式: Lab -> XYZ -> sRGB
+
+    # 分离 L, a, b
+    L, a, b = lab[:, 0], lab[:, 1], lab[:, 2]
+
+    # 计算 f^-1(t)
+    eps = 216 / 24389
+    kappa = 24389 / 27
+
+    # 反 f(t) 函数
+    fy = (L + 16) / 116
+    fx = a / 500 + fy
+    fz = fy - b / 200
+
+    # 计算 XYZ 值
+    xyz = torch.stack([fx, fy, fz], dim=1)
+
+    # 逆操作：f^-1(t)
+    mask = (xyz > eps).float()
+    xyz = torch.where(mask == 1,
+                    (xyz ** 3),  # f^-1(t) = xyz^3
+                    (xyz - 16 / 116) * 24389 / 27)  # f^-1(t) = (xyz - 16/116) * kappa
+
+    # 恢复 XYZ (D65)
+    xyz_ref = torch.tensor([0.95047, 1.00000, 1.08883], dtype=lab.dtype, device=lab.device)
+    xyz = xyz * xyz_ref
+
+    # XYZ to sRGB
+    M_inv = torch.tensor([[3.2404542, -1.5371385, -0.4985314],
+                        [-0.9692660, 1.8760108, 0.0415560],
+                        [0.0556434, -0.2040259, 1.0572252]], 
+                        dtype=lab.dtype, device=lab.device)
+    rgb_lin = torch.matmul(xyz, M_inv.T)
+
+    # sRGB gamma correction
+    mask = (rgb_lin > 0.0031308).float()
+    rgb = ((rgb_lin ** (1 / 2.4)) * 1.055 - 0.055) * mask + (rgb_lin * 12.92) * (1 - mask)
+
+    # Clip RGB values to the range [0, 1]
+    rgb = torch.clamp(rgb, 0.0, 1.0)
+
+    rgb = torch.nan_to_num(rgb, nan=0.0)
+
+    return rgb  # [N, 3]
+
+def generate_lab_colors(M, device):
+    # 在 Lab 空间中，L*：亮度（0到100），a*：红绿色（-128到127），b*：蓝黄色（-128到127）
+    L = 50  # 固定亮度（L*）
+    a = np.random.randint(-128, 128)  # 随机生成红绿分量 (a*)
+    b = np.random.randint(-128, 128)  # 随机生成蓝黄分量 (b*)
+    
+    # 创建 Lab 颜色 (L*, a*, b*)
+    lab_color = np.array([L, a, b])
+    
+    # 将 RGB 颜色复制 M 次，并转换为 PyTorch tensor
+    lab_tensor = torch.tensor(np.tile(lab_color, (M, 1)), dtype=torch.float32, device=device)
+    
+    return lab_tensor
 
 def majority_voting(gaussians, scene, pipe, background, dataset, args):
     # 这里 *list 的意思是把列表里的元素依次传入函数
@@ -204,8 +319,7 @@ def majority_voting(gaussians, scene, pipe, background, dataset, args):
         
     return averaged_tensor
 
-def cosine_similarity_clustering(features, threshold=0.9, block_size=50000):
-
+def cosine_similarity_clustering(features, threshold=0.95, block_size=50000):
     N = features.shape[0]
     device = features.device
     free_mask = torch.ones(N, dtype=torch.bool, device=device) # [N]
@@ -228,7 +342,7 @@ def cosine_similarity_clustering(features, threshold=0.9, block_size=50000):
 
     return cluster_ids
         
-def compute_significant_mask(contribution, ids, N, max_threshold=0.01, block_size=10000, use_max_weight=True, sum_threshold=0.25):
+def compute_significant_mask(contribution, ids, N, max_threshold=0.1, block_size=10000, use_max_weight=True, sum_threshold=0.25):
     device = contribution.device
     if use_max_weight:
         per_gauss_contrib = torch.zeros(N, device=device, dtype=contribution.dtype)  # [N]
@@ -253,13 +367,30 @@ def compute_significant_mask(contribution, ids, N, max_threshold=0.01, block_siz
     return significant_mask
 
 def laplacian_smoothing(gaussians, cluster_ids, full_significant_mask, lambda_reg=0.5, k_neighbors=5):
+    # N = gaussians.get_thermal_features.shape[0]
+    # colors = torch.zeros((N, 3), device=full_significant_mask.device, dtype=torch.float32)
+    # colors[full_significant_mask] = torch.ones((full_significant_mask.sum().item(), 3), device=full_significant_mask.device, dtype=torch.float32)
+    # return torch.logit(colors, eps=1e-10)
+
     N = gaussians.get_thermal_features.shape[0]
     device = gaussians.get_thermal_features.device
-    thermal_features = gaussians.get_thermal_features.clone()   # [N,K,3]
+    # thermal_features = gaussians.get_thermal_features.clone()   # [N,K,3]
+    colors = rgb_to_lab(torch.sigmoid(gaussians._thermal_features_dc))   # [N,3]
 
     unique_cluster_ids = torch.unique(cluster_ids).cpu()
+    retain_mask = torch.ones(N, device=device, dtype=torch.bool)
     for cluster_id in unique_cluster_ids:
         indices = torch.where(cluster_ids == cluster_id)[0] # [M]
+        significant_mask = full_significant_mask[indices]    # [M]
+
+        known_colors = colors[indices][significant_mask]  # [M1,3]
+        M1 = known_colors.shape[0]
+        if M1 == 0:
+            # retain_mask[indices] = False
+            print('Warning: there is no known color in a group')
+            continue
+        non_significant_mask = ~significant_mask    # [M]
+
         means = gaussians.get_xyz[indices]  # [M]
         M = means.shape[0]
         k = min(M - 1, k_neighbors)
@@ -285,42 +416,52 @@ def laplacian_smoothing(gaussians, cluster_ids, full_significant_mask, lambda_re
         del degree_matrix, adj_matrix
         gc.collect()
 
-        significant_mask = full_significant_mask[indices]    # [M]
-
-        non_significant_mask = ~significant_mask    # [M]
         L_ii = laplacian_matrix[non_significant_mask, :][:, non_significant_mask]  # [M2,M2]
         L_ij = laplacian_matrix[non_significant_mask, :][:, significant_mask]  # [M2,M1]
         del laplacian_matrix
         gc.collect()
 
-        known_features = thermal_features[indices][significant_mask]  # [M1,K,3]
-        M1 = known_features.shape[0]
-        if M1 == 0:
-            print('Warning: there is no known feature in a group')
-            continue
-        M2 = M - M1
-        K = known_features.shape[1]
-        known_features = known_features.reshape(M1, -1) # [M1,K*3]
-
-        # 对于非显著节点，使用图拉普拉斯平滑
-        # 目标是解决方程: L_ii * unknown_features = -L_ij * known_features
-        rhs = -torch.mm(L_ij, known_features)  # [M2,K*3]
+        rhs = -torch.mm(L_ij, known_colors)  # [M2,3]
         lhs = L_ii + lambda_reg * torch.eye(L_ii.shape[0], device=device)   # [M2,M2]
 
         try:
-            smooth_unknown_features = torch.linalg.solve(lhs, rhs).reshape(M2, K, 3)    # [M2,K*3] -> [M2,K,3]
+            smooth_unknown_colors = torch.linalg.solve(lhs, rhs)    # [M2,3]
         except torch.linalg.LinAlgError:
             print('Warning: the input matrix is singular')
-            smooth_unknown_features = torch.linalg.lstsq(lhs, rhs)[0].reshape(M2, K, 3)
+            smooth_unknown_colors = torch.linalg.lstsq(lhs, rhs)[0]
 
         del L_ii, L_ij
         gc.collect()
 
-        thermal_features[indices][non_significant_mask] = smooth_unknown_features
+        colors[indices][non_significant_mask] = smooth_unknown_colors
 
-    sye.exit(0)
-    return thermal_features
+        # known_features = thermal_features[indices][significant_mask]  # [M1,K,3]
+        # M1 = known_features.shape[0]
+        # if M1 == 0:
+        #     print('Warning: there is no known feature in a group')
+        #     continue
+        # M2 = M - M1
+        # K = known_features.shape[1]
+        # known_features = known_features.reshape(M1, -1) # [M1,K*3]
 
+        # 对于非显著节点，使用图拉普拉斯平滑
+        # 目标是解决方程: L_ii * unknown_features = -L_ij * known_features
+        # rhs = -torch.mm(L_ij, known_features)  # [M2,K*3]
+        # lhs = L_ii + lambda_reg * torch.eye(L_ii.shape[0], device=device)   # [M2,M2]
+
+        # try:
+        #     smooth_unknown_features = torch.linalg.solve(lhs, rhs).reshape(M2, K, 3)    # [M2,K*3] -> [M2,K,3]
+        # except torch.linalg.LinAlgError:
+        #     print('Warning: the input matrix is singular')
+        #     smooth_unknown_features = torch.linalg.lstsq(lhs, rhs)[0].reshape(M2, K, 3)
+
+        # del L_ii, L_ij
+        # gc.collect()
+
+        # thermal_features[indices][non_significant_mask] = smooth_unknown_features
+
+    # return thermal_features
+    return  torch.logit(lab_to_rgb(colors), eps=1e-10), retain_mask  # [N,3]
 
 def temperature_propagation(gaussians, scene, pipe, background, dataset, args):
     num_gaussians = len(gaussians.get_opacity)
@@ -342,11 +483,11 @@ def temperature_propagation(gaussians, scene, pipe, background, dataset, args):
 
     cluster_ids = cosine_similarity_clustering(gaussians.get_language_feature)
     significant_mask = compute_significant_mask(contribution_stack, ids_stack, num_gaussians)
-    thermal_features = laplacian_smoothing(gaussians, cluster_ids, significant_mask)
+    # thermal_features = laplacian_smoothing(gaussians, cluster_ids, significant_mask)
+    thermal_colors, retain_mask = laplacian_smoothing(gaussians, cluster_ids, significant_mask)
 
-    print('temperature_propagation finished')
-
-    return thermal_features
+    # return thermal_features
+    return thermal_colors, retain_mask
     
 # training(lp.extract(args), op.extract(args), pp.extract(args), 
 # args.test_iterations, args.save_iterations, args.checkpoint_iterations, args.start_checkpoint, args.debug_from, args)
@@ -395,22 +536,29 @@ def smoothing(dataset, opt, pipe, checkpoint, args):
     gaussians._rotation = gaussians._rotation[gaussians_mask]
     gaussians._opacity = gaussians._opacity[gaussians_mask]
 
-    thermal_features = temperature_propagation(gaussians, scene, pipe, background, dataset, args)
-    gaussians._thermal_features_dc = thermal_features[:, 0, :]
-    gaussians._thermal_features_rest = thermal_features[:, 1:, :]
+    # thermal_features = temperature_propagation(gaussians, scene, pipe, background, dataset, args)
+    # gaussians._thermal_features_dc = thermal_features[:, 0, :]
+    # gaussians._thermal_features_rest = thermal_features[:, 1:, :]
+    gaussians._thermal_features_dc, retain_mask = temperature_propagation(gaussians, scene, pipe, background, dataset, args)
 
     gaussians_mask = gaussians_mask.cpu()
-    ckpt["pipeline"]["_model.gauss_params.thermal_features_dc"] = gaussians._thermal_features_dc.cpu()
-    ckpt["pipeline"]["_model.gauss_params.thermal_features_rest"] = gaussians._thermal_features_rest.cpu()
-    ckpt["pipeline"]["_model.gauss_params.means"] = ckpt["pipeline"]["_model.gauss_params.means"][gaussians_mask]
-    ckpt["pipeline"]["_model.gauss_params.scales"] = ckpt["pipeline"]["_model.gauss_params.scales"][gaussians_mask]
-    ckpt["pipeline"]["_model.gauss_params.quats"] = ckpt["pipeline"]["_model.gauss_params.quats"][gaussians_mask]
-    ckpt["pipeline"]["_model.gauss_params.opacities"] = ckpt["pipeline"]["_model.gauss_params.opacities"][gaussians_mask]
-    ckpt["pipeline"]["_model.gauss_params.features_dc"] = ckpt["pipeline"]["_model.gauss_params.features_dc"][gaussians_mask]
-    ckpt["pipeline"]["_model.gauss_params.features_rest"] = ckpt["pipeline"]["_model.gauss_params.features_rest"][gaussians_mask]
-    base_name, ext = os.path.splitext(checkpoint)
-    new_checkpoint = base_name + "_origin" + ext
-    os.rename(checkpoint, new_checkpoint)
+    retain_mask = retain_mask.cpu()
+    ckpt["pipeline"]["_model.gauss_params.thermal_features_dc"] = gaussians._thermal_features_dc[retain_mask].cpu()
+    ckpt["pipeline"]["_model.gauss_params.thermal_features_rest"] = gaussians._thermal_features_rest[retain_mask].cpu()
+    ckpt["pipeline"]["_model.gauss_params.means"] = ckpt["pipeline"]["_model.gauss_params.means"][gaussians_mask][retain_mask]
+    ckpt["pipeline"]["_model.gauss_params.scales"] = ckpt["pipeline"]["_model.gauss_params.scales"][gaussians_mask][retain_mask]
+    ckpt["pipeline"]["_model.gauss_params.quats"] = ckpt["pipeline"]["_model.gauss_params.quats"][gaussians_mask][retain_mask]
+    ckpt["pipeline"]["_model.gauss_params.opacities"] = ckpt["pipeline"]["_model.gauss_params.opacities"][gaussians_mask][retain_mask]
+    ckpt["pipeline"]["_model.gauss_params.features_dc"] = ckpt["pipeline"]["_model.gauss_params.features_dc"][gaussians_mask][retain_mask]
+    ckpt["pipeline"]["_model.gauss_params.features_rest"] = ckpt["pipeline"]["_model.gauss_params.features_rest"][gaussians_mask][retain_mask]
+
+    # print('Smoothing test passed.')
+    # sys.exit(0)
+
+    # base_name, ext = os.path.splitext(checkpoint)
+    # new_checkpoint = base_name + "_origin" + ext
+    # os.rename(checkpoint, new_checkpoint)
+    os.remove(checkpoint)
     torch.save(ckpt, checkpoint)
     
     # iteration = 0
@@ -431,60 +579,23 @@ def smoothing(dataset, opt, pipe, checkpoint, args):
     #     new_checkpoint = base_name + "_smooth" + ext
     #     torch.save(ckpt, new_checkpoint)
 
-def prepare_output_and_logger(args):    
-    if not args.model_path:
-        if os.getenv('OAR_JOB_ID'):
-            unique_str=os.getenv('OAR_JOB_ID')
-        else:
-            unique_str = str(uuid.uuid4())
-        args.model_path = os.path.join("./output/", unique_str[0:10])
-        
-    # Set up output folder
-    print("Output folder: {}".format(args.model_path))
-    os.makedirs(args.model_path, exist_ok = True)
-    with open(os.path.join(args.model_path, "cfg_args"), 'w') as cfg_log_f:
-        cfg_log_f.write(str(Namespace(**vars(args))))
+def move_checkpoint_file(args):
+    # 检查文件是否存在
+    if os.path.exists(args.start_checkpoint):
+        print(f"File {args.start_checkpoint} exists. Deleting it.")
+        os.remove(args.start_checkpoint)  # 删除文件
 
-    # Create Tensorboard writer
-    tb_writer = None
-    if TENSORBOARD_FOUND:
-        tb_writer = SummaryWriter(args.model_path)
+    # 获取 args.start_checkpoint 所在目录的父目录
+    parent_dir = os.path.dirname(os.path.abspath(args.start_checkpoint))
+    origin_checkpoint_path = os.path.join(os.path.dirname(parent_dir), 'origin', 'step-000000299.ckpt')
+
+    # 检查 origin/step-000000299.ckpt 是否存在
+    if os.path.exists(origin_checkpoint_path):
+        print(f"Copying {origin_checkpoint_path} to {parent_dir}")
+        shutil.copy2(origin_checkpoint_path, args.start_checkpoint)  # 复制文件
     else:
-        print("Tensorboard not available: not logging progress")
-    return tb_writer
-
-def training_report(tb_writer, iteration, testing_iterations, scene : Scene, renderFunc, renderArgs):
-    # Report test and samples of training set
-    if iteration in testing_iterations:
-        print(f'testing for iter {iteration}')
-        torch.cuda.empty_cache()
-        validation_configs = ({'name': 'test', 'cameras' : scene.getTestCameras()}, 
-                              {'name': 'train', 'cameras' : [scene.getTrainCameras()[idx % len(scene.getTrainCameras())] for idx in range(5, 30, 5)]})
-
-        for config in validation_configs:
-            if config['cameras'] and len(config['cameras']) > 0:
-                l1_test = 0.0
-                psnr_test = 0.0
-                for idx, viewpoint in enumerate(config['cameras']):
-                    image = torch.clamp(renderFunc(viewpoint, scene.gaussians, *renderArgs)["render"], 0.0, 1.0)
-                    gt_image = torch.clamp(viewpoint.original_image.to("cuda"), 0.0, 1.0)
-                    if tb_writer and (idx < 5):
-                        tb_writer.add_images(config['name'] + "_view_{}/render".format(viewpoint.image_name), image[None], global_step=iteration)
-                        if iteration == testing_iterations[0]:
-                            tb_writer.add_images(config['name'] + "_view_{}/ground_truth".format(viewpoint.image_name), gt_image[None], global_step=iteration)
-                    l1_test += l1_loss(image, gt_image).mean().double()
-                    psnr_test += psnr(image, gt_image).mean().double()
-                psnr_test /= len(config['cameras'])
-                l1_test /= len(config['cameras'])          
-                print("\n[ITER {}] Evaluating {}: L1 {} PSNR {}".format(iteration, config['name'], l1_test, psnr_test))
-                if tb_writer:
-                    tb_writer.add_scalar(config['name'] + '/loss_viewpoint - l1_loss', l1_test, iteration)
-                    tb_writer.add_scalar(config['name'] + '/loss_viewpoint - psnr', psnr_test, iteration)
-
-        if tb_writer:
-            tb_writer.add_histogram("scene/opacity_histogram", scene.gaussians.get_opacity, iteration)
-            tb_writer.add_scalar('total_points', scene.gaussians.get_xyz.shape[0], iteration)
-        torch.cuda.empty_cache()
+        print(f"File {origin_checkpoint_path} does not exist.")
+        sys.exit(-1)
 
 if __name__ == "__main__":
     # Set up command line argument parser
@@ -536,6 +647,8 @@ if __name__ == "__main__":
 
     safe_state(args.quiet)
     torch.set_grad_enabled(False)
+
+    move_checkpoint_file(args)
 
     # 在 PyTorch 中，autograd 会记录运算过程并自动求导。有时候在反向传播（loss.backward()）时，会遇到 NaN、inf 或非法操作，但报错信息并不会直接告诉你是在哪个算子里出的问题，调试起来很麻烦
     # 调用 torch.autograd.set_detect_anomaly(True) 后，PyTorch 会在反向传播时逐步检查每个算子 的梯度计算，一旦发现 NaN 或 inf，就会立刻报错，并指出具体是在哪个算子里出现的异常
