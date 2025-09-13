@@ -47,6 +47,7 @@ from nerfstudio.utils import colormaps
 from tsplatter.data.ts_dataset import TSDataset
 from tsplatter.utils.normal_utils import normal_from_depth_image
 from tsplatter.losses import NormalLoss, NormalLossType
+from tsplatter.utils.color_utils import rgb_to_lab, lab_to_rgb
 
 def unproject_depth_to_world(depth_im, Ks, viewmats):
     C, W, H, _ = depth_im.shape
@@ -979,85 +980,6 @@ class TSplatterModel(SplatfactoModel):
         q = self.rotmat_to_quat(eigvecs)
         return q, scales
 
-    def rgb_to_lab(self, rgb: torch.Tensor) -> torch.Tensor:
-        # rgb: [N, 3], 取值 [0,1]
-        # 参考公式: sRGB -> XYZ -> Lab
-        
-        # sRGB gamma correction
-        mask = (rgb > 0.04045).float()
-        rgb_lin = (((rgb + 0.055) / 1.055) ** 2.4) * mask + (rgb / 12.92) * (1 - mask)
-        
-        # sRGB to XYZ (D65)
-        M = torch.tensor([[0.4124564, 0.3575761, 0.1804375],
-                        [0.2126729, 0.7151522, 0.0721750],
-                        [0.0193339, 0.1191920, 0.9503041]], 
-                        dtype=rgb.dtype, device=rgb.device)
-        xyz = rgb_lin @ M.T
-
-        # Normalize by reference white (D65)
-        xyz_ref = torch.tensor([0.95047, 1.00000, 1.08883], 
-                            dtype=rgb.dtype, device=rgb.device)
-        xyz = xyz / xyz_ref
-
-        # f(t) function
-        eps = 216/24389
-        kappa = 24389/27
-        mask = (xyz > eps).float()
-        f = xyz.pow(1/3) * mask + ((kappa * xyz + 16) / 116) * (1 - mask)
-
-        L = (116 * f[:,1] - 16).unsqueeze(1)
-        a = (500 * (f[:,0] - f[:,1])).unsqueeze(1)
-        b = (200 * (f[:,1] - f[:,2])).unsqueeze(1)
-
-        return torch.cat([L,a,b], dim=1)  # [N,3]
-
-    def lab_to_rgb(self, lab: torch.Tensor) -> torch.Tensor:
-        # lab: [N, 3]
-        # 参考公式: Lab -> XYZ -> sRGB
-
-        # 分离 L, a, b
-        L, a, b = lab[:, 0], lab[:, 1], lab[:, 2]
-
-        # 计算 f^-1(t)
-        eps = 216 / 24389
-        kappa = 24389 / 27
-
-        # 反 f(t) 函数
-        fy = (L + 16) / 116
-        fx = a / 500 + fy
-        fz = fy - b / 200
-
-        # 计算 XYZ 值
-        xyz = torch.stack([fx, fy, fz], dim=1)
-
-        # 逆操作：f^-1(t)
-        mask = (xyz > eps).float()
-        xyz = torch.where(mask == 1,
-                        (xyz ** 3),  # f^-1(t) = xyz^3
-                        (xyz - 16 / 116) * 24389 / 27)  # f^-1(t) = (xyz - 16/116) * kappa
-
-        # 恢复 XYZ (D65)
-        xyz_ref = torch.tensor([0.95047, 1.00000, 1.08883], dtype=lab.dtype, device=lab.device)
-        xyz = xyz * xyz_ref
-
-        # XYZ to sRGB
-        M_inv = torch.tensor([[3.2404542, -1.5371385, -0.4985314],
-                            [-0.9692660, 1.8760108, 0.0415560],
-                            [0.0556434, -0.2040259, 1.0572252]], 
-                            dtype=lab.dtype, device=lab.device)
-        rgb_lin = torch.matmul(xyz, M_inv.T)
-
-        # sRGB gamma correction
-        mask = (rgb_lin > 0.0031308).float()
-        rgb = ((rgb_lin ** (1 / 2.4)) * 1.055 - 0.055) * mask + (rgb_lin * 12.92) * (1 - mask)
-
-        # Clip RGB values to the range [0, 1]
-        rgb = torch.clamp(rgb, 0.0, 1.0)
-
-        rgb = torch.nan_to_num(rgb, nan=0.0)
-
-        return rgb  # [N, 3]
-
     def merge_params_blockwise(self, mu_i, mu_j, Sigma_i, Sigma_j, alpha_i, alpha_j, f_i, f_j, block_size=1000000):
         num_pairs = mu_i.shape[0]
         device = mu_i.device
@@ -1129,7 +1051,7 @@ class TSplatterModel(SplatfactoModel):
         quats = self.quats[merge_mask]
         scales = torch.exp(self.scales[merge_mask])
         opacities = torch.sigmoid(self.opacities[merge_mask]).squeeze(-1)
-        colors = self.rgb_to_lab(self.thermal_colors[merge_mask])
+        colors = rgb_to_lab(self.thermal_colors[merge_mask])
 
         covs = self.get_covariance(quats, scales)     # [M,3,3]
         # inv_covs = torch.linalg.pinv(covs)            # [M,3,3]
@@ -1218,7 +1140,7 @@ class TSplatterModel(SplatfactoModel):
 
         out = {
             "means": mu_new,
-            "thermal_features_dc": torch.logit(self.lab_to_rgb(f_new), eps=1e-10),
+            "thermal_features_dc": torch.logit(lab_to_rgb(f_new), eps=1e-10),
             "opacities": torch.logit(alpha_new, eps=1e-10).unsqueeze(1),
             "scales": torch.log(s_new),
             "quats": q_new,

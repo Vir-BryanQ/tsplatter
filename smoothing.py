@@ -40,6 +40,7 @@ import gc
 import umap
 import matplotlib.pyplot as plt
 import shutil
+from tsplatter.utils.color_utils import rgb_to_lab, lab_to_rgb
 
 # from autoencoder.model import Autoencoder
 
@@ -99,85 +100,6 @@ def visualize_features(features):
     plt.grid(True)
     plt.savefig('umap_visualization.png', dpi=300) 
     plt.close()
-
-def rgb_to_lab(rgb: torch.Tensor) -> torch.Tensor:
-    # rgb: [N, 3], 取值 [0,1]
-    # 参考公式: sRGB -> XYZ -> Lab
-    
-    # sRGB gamma correction
-    mask = (rgb > 0.04045).float()
-    rgb_lin = (((rgb + 0.055) / 1.055) ** 2.4) * mask + (rgb / 12.92) * (1 - mask)
-    
-    # sRGB to XYZ (D65)
-    M = torch.tensor([[0.4124564, 0.3575761, 0.1804375],
-                    [0.2126729, 0.7151522, 0.0721750],
-                    [0.0193339, 0.1191920, 0.9503041]], 
-                    dtype=rgb.dtype, device=rgb.device)
-    xyz = rgb_lin @ M.T
-
-    # Normalize by reference white (D65)
-    xyz_ref = torch.tensor([0.95047, 1.00000, 1.08883], 
-                        dtype=rgb.dtype, device=rgb.device)
-    xyz = xyz / xyz_ref
-
-    # f(t) function
-    eps = 216/24389
-    kappa = 24389/27
-    mask = (xyz > eps).float()
-    f = xyz.pow(1/3) * mask + ((kappa * xyz + 16) / 116) * (1 - mask)
-
-    L = (116 * f[:,1] - 16).unsqueeze(1)
-    a = (500 * (f[:,0] - f[:,1])).unsqueeze(1)
-    b = (200 * (f[:,1] - f[:,2])).unsqueeze(1)
-
-    return torch.cat([L,a,b], dim=1)  # [N,3]
-
-def lab_to_rgb(lab: torch.Tensor) -> torch.Tensor:
-    # lab: [N, 3]
-    # 参考公式: Lab -> XYZ -> sRGB
-
-    # 分离 L, a, b
-    L, a, b = lab[:, 0], lab[:, 1], lab[:, 2]
-
-    # 计算 f^-1(t)
-    eps = 216 / 24389
-    kappa = 24389 / 27
-
-    # 反 f(t) 函数
-    fy = (L + 16) / 116
-    fx = a / 500 + fy
-    fz = fy - b / 200
-
-    # 计算 XYZ 值
-    xyz = torch.stack([fx, fy, fz], dim=1)
-
-    # 逆操作：f^-1(t)
-    mask = (xyz > eps).float()
-    xyz = torch.where(mask == 1,
-                    (xyz ** 3),  # f^-1(t) = xyz^3
-                    (xyz - 16 / 116) * 24389 / 27)  # f^-1(t) = (xyz - 16/116) * kappa
-
-    # 恢复 XYZ (D65)
-    xyz_ref = torch.tensor([0.95047, 1.00000, 1.08883], dtype=lab.dtype, device=lab.device)
-    xyz = xyz * xyz_ref
-
-    # XYZ to sRGB
-    M_inv = torch.tensor([[3.2404542, -1.5371385, -0.4985314],
-                        [-0.9692660, 1.8760108, 0.0415560],
-                        [0.0556434, -0.2040259, 1.0572252]], 
-                        dtype=lab.dtype, device=lab.device)
-    rgb_lin = torch.matmul(xyz, M_inv.T)
-
-    # sRGB gamma correction
-    mask = (rgb_lin > 0.0031308).float()
-    rgb = ((rgb_lin ** (1 / 2.4)) * 1.055 - 0.055) * mask + (rgb_lin * 12.92) * (1 - mask)
-
-    # Clip RGB values to the range [0, 1]
-    rgb = torch.clamp(rgb, 0.0, 1.0)
-
-    rgb = torch.nan_to_num(rgb, nan=0.0)
-
-    return rgb  # [N, 3]
 
 def generate_lab_colors(M, device):
     # 在 Lab 空间中，L*：亮度（0到100），a*：红绿色（-128到127），b*：蓝黄色（-128到127）
@@ -284,18 +206,19 @@ def majority_voting(gaussians, scene, pipe, background, dataset, args):
     # 将feature vector归一化
     features_array /= (features_array.norm(dim=-1, keepdim=True) + 1e-9)
 
-    weight_sum = torch.sum(allocate_array, 1)
-    threshold = 1e-4
-    weight_sum_over_zero = weight_sum>0
-    weight_sum_under_threshold = weight_sum<threshold
-    reweight_index = weight_sum_over_zero * weight_sum_under_threshold
+    weight_sum = torch.sum(allocate_array, 1)   # [N]
+    allocate_array /= (weight_sum[:, None] + 1e-9)    # 对权值进行归一化
+
+    # threshold = 1e-4
+    # weight_sum_over_zero = weight_sum>0
+    # weight_sum_under_threshold = weight_sum<threshold
+    # reweight_index = weight_sum_over_zero * weight_sum_under_threshold
     # 先选择 allocate_array 中对应 reweight_index 为 True 的元素，然后从这些元素中选择大于零的元素，最后将这些大于零的元素的值设置为 1
-    allocate_array[reweight_index][allocate_array[reweight_index]>0] = 1
+    # allocate_array[reweight_index][allocate_array[reweight_index]>0] = 1    # 不会起作用
 
     # 对所有feature进行加权求和
-    averaged_tensor = torch.matmul(allocate_array.type(torch.float32) ,features_array)
+    averaged_tensor = torch.matmul(allocate_array.type(torch.float32), features_array)
     averaged_tensor /= (averaged_tensor.norm(dim=-1, keepdim=True) + 1e-9)  # 归一化
-
 
     # if args.use_pq:
     #     index = faiss.read_index(args.pq_index)
@@ -342,7 +265,7 @@ def cosine_similarity_clustering(features, threshold=0.95, block_size=50000):
 
     return cluster_ids
         
-def compute_significant_mask(contribution, ids, N, max_threshold=0.1, block_size=10000, use_max_weight=True, sum_threshold=0.25):
+def compute_significant_mask(contribution, ids, N, max_threshold=0.1, block_size=10000, use_max_weight=True, sum_threshold=3):
     device = contribution.device
     if use_max_weight:
         per_gauss_contrib = torch.zeros(N, device=device, dtype=contribution.dtype)  # [N]
@@ -363,10 +286,10 @@ def compute_significant_mask(contribution, ids, N, max_threshold=0.1, block_size
         ids = ids[valid_mask]
         per_gauss_contrib.index_put_((ids,), contribution, accumulate=True)
         significant_mask = per_gauss_contrib > sum_threshold  # [N]
-    
+
     return significant_mask
 
-def laplacian_smoothing(gaussians, cluster_ids, full_significant_mask, lambda_reg=0.5, k_neighbors=5):
+def laplacian_smoothing(gaussians, cluster_ids, full_significant_mask, lambda_reg=1e-3, k_neighbors=100_000_000):
     # N = gaussians.get_thermal_features.shape[0]
     # colors = torch.zeros((N, 3), device=full_significant_mask.device, dtype=torch.float32)
     # colors[full_significant_mask] = torch.ones((full_significant_mask.sum().item(), 3), device=full_significant_mask.device, dtype=torch.float32)
@@ -377,8 +300,9 @@ def laplacian_smoothing(gaussians, cluster_ids, full_significant_mask, lambda_re
     # thermal_features = gaussians.get_thermal_features.clone()   # [N,K,3]
     colors = rgb_to_lab(torch.sigmoid(gaussians._thermal_features_dc))   # [N,3]
 
-    unique_cluster_ids = torch.unique(cluster_ids).cpu()
+    unique_cluster_ids = torch.unique(cluster_ids)
     retain_mask = torch.ones(N, device=device, dtype=torch.bool)
+
     for cluster_id in unique_cluster_ids:
         indices = torch.where(cluster_ids == cluster_id)[0] # [M]
         significant_mask = full_significant_mask[indices]    # [M]
@@ -398,6 +322,8 @@ def laplacian_smoothing(gaussians, cluster_ids, full_significant_mask, lambda_re
         euclidean_dists = torch.cdist(means, means)   # [M,M]
         knn_idx = euclidean_dists.topk(k + 1, largest=False).indices   # [M,k+1]
         weights = 1 / (euclidean_dists + 1e-9)  # [M,M]  
+        # weights = 1 / (euclidean_dists * euclidean_dists + 1e-9)  # [M,M]  
+
         del euclidean_dists
         gc.collect()
 
@@ -427,13 +353,15 @@ def laplacian_smoothing(gaussians, cluster_ids, full_significant_mask, lambda_re
         try:
             smooth_unknown_colors = torch.linalg.solve(lhs, rhs)    # [M2,3]
         except torch.linalg.LinAlgError:
+            # 病态矩阵
             print('Warning: the input matrix is singular')
             smooth_unknown_colors = torch.linalg.lstsq(lhs, rhs)[0]
 
         del L_ii, L_ij
         gc.collect()
 
-        colors[indices][non_significant_mask] = smooth_unknown_colors
+        colors[indices[non_significant_mask]] = smooth_unknown_colors
+        # colors[indices[non_significant_mask]] = rgb_to_lab(torch.ones_like(smooth_unknown_colors))
 
         # known_features = thermal_features[indices][significant_mask]  # [M1,K,3]
         # M1 = known_features.shape[0]
@@ -526,6 +454,7 @@ def smoothing(dataset, opt, pipe, checkpoint, args):
     maj_feat = majority_voting(gaussians, scene, pipe, background, dataset, args)
     # 删除feature为零向量的高斯
     gaussians_mask = maj_feat.norm(dim=-1) > 0  # [N]
+
     gaussians._language_feature = maj_feat[gaussians_mask]
     gaussians._xyz = gaussians._xyz[gaussians_mask]
     gaussians._features_dc = gaussians._features_dc[gaussians_mask]
