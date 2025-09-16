@@ -125,7 +125,8 @@ class DINOv2Model(nn.Module):
                 ),
             ]
         )
-        model = torch.hub.load('facebookresearch/dinov2', config.dino_model_pretrained)
+        torch.hub._validate_not_a_forked_repo=lambda a,b,c: True
+        model = torch.hub.load('facebookresearch/dinov2:qasfb-patch-3', config.dino_model_pretrained)
         model.eval()
         self.model = model.to("cuda").half()
     
