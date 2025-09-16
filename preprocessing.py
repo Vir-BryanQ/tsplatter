@@ -1,6 +1,7 @@
 import os
 import random
 import argparse
+import sys
 
 import numpy as np
 import torch
@@ -48,7 +49,7 @@ class OpenCLIPNetwork(nn.Module):
         model, _, _ = open_clip.create_model_and_transforms(
             self.config.clip_model_type,  # e.g., ViT-B-16
             pretrained=self.config.clip_model_pretrained,  # e.g., laion2b_s34b_b88k
-            precision="fp16",
+            precision="fp16",   # 使用半精度
         )
         model.eval()
         self.tokenizer = open_clip.get_tokenizer(self.config.clip_model_type)
@@ -107,10 +108,38 @@ class OpenCLIPNetwork(nn.Module):
         processed_input = self.process(input).half()
         return self.model.encode_image(processed_input)
 
+@dataclass
+class DINOv2ModelConfig:
+    dino_model_pretrained: str = 'dinov2_vitb14'
+    feat_dim: int = 768
+
+class DINOv2Model(nn.Module):
+    def __init__(self, config: DINOv2ModelConfig):
+        super().__init__()
+        self.config = config
+        self.process = torchvision.transforms.Compose(
+            [
+                torchvision.transforms.Normalize(
+                    mean=[0.485, 0.456, 0.406],
+                    std=[0.229, 0.224, 0.225],
+                ),
+            ]
+        )
+        model = torch.hub.load('facebookresearch/dinov2', config.dino_model_pretrained)
+        model.eval()
+        self.model = model.to("cuda").half()
+    
+    @property
+    def embedding_dim(self):
+        return self.config.feat_dim
+        
+    def encode_image(self, input):
+        processed_input = self.process(input).half()
+        return self.model(processed_input)
 
 def create(image_list, data_list, save_folder, dataset_path):
     assert image_list is not None, "image_list must be provided to generate features"
-    embed_size=512  # 使用512维的feature vector
+    embed_size = model.embedding_dim
     seg_maps = []
     total_lengths = []
     timer = 0
@@ -125,17 +154,19 @@ def create(image_list, data_list, save_folder, dataset_path):
         # img 是每一张图片的张量，形状是 [3, H, W]
         # desc="Embedding images"：前缀标题
         # leave=False：运行完后不保留进度条
-        timer += 1
-        try:
-            # img_embed: {'l': [b, D]}
-            # seg_map: {'l': [H, W]}
-            img_embed, seg_map = _embed_clip_sam_tiles(img.unsqueeze(0), sam_encoder)
-        except:
-            seg_maps[i] = -1
-            total_lengths.append(0)
 
-            # raise ValueError(timer)
-            continue                
+        # timer += 1
+        # try:
+        #     # img_embed: {'l': [b, D]}
+        #     # seg_map: {'l': [H, W]}
+        #     img_embed, seg_map = _embed_clip_sam_tiles(img.unsqueeze(0), sam_encoder)
+        # except:
+        #     seg_maps[i] = -1
+        #     total_lengths.append(0)
+        #     # raise ValueError(timer)
+        #     continue   
+        # sys.exit(0)发出的异常被try-except捕获导致程序没有正常退出
+        img_embed, seg_map = _embed_clip_dino_sam_tiles(img.unsqueeze(0), sam_encoder)             
 
         # 在 PyTorch 中，len(tensor) 返回的是：张量第 0 维的大小，即 tensor.shape[0]
         lengths = [len(v) for k, v in img_embed.items()]
@@ -194,14 +225,14 @@ def sava_numpy(save_path, data):
     np.save(save_path_s, data['seg_maps'].numpy())
     np.save(save_path_f, data['feature'].numpy())
 
-def _embed_clip_sam_tiles(image, sam_encoder):
+def _embed_clip_dino_sam_tiles(image, sam_encoder):
     # image [1,3,H,W]
     aug_imgs = torch.cat([image])   # 虽然语法上是合法的，但它的作用其实没什么意义，结果 aug_imgs 和 image 是一样的
     seg_images, seg_map = sam_encoder(aug_imgs)
     # seg_images: { 'default': [b1,3,224,224], 's': [b2,3,224,224], 'm': [b3,3,224,224], 'l': [b4,3,224,224] }
     # seg_map: {'default': [H,W], 's': [H,W], 'm': [H,W], 'l': [H,W]}
 
-    clip_embeds = {}
+    feat_embeds = {}
     for mode in ['default', 's', 'm', 'l']:
     # for mode in ['l']:
         tiles = seg_images[mode]    # b,3,224,224
@@ -209,13 +240,13 @@ def _embed_clip_sam_tiles(image, sam_encoder):
         with torch.no_grad():
             # clip_embed = model.encode_image(tiles)[0]
             # CLIP或者DINO
-            clip_embed = model.encode_image(tiles)  # [b, D]
-        clip_embed /= clip_embed.norm(dim=-1, keepdim=True)     # 将embedding归一化
-        clip_embeds[mode] = clip_embed.detach().cpu().half()    # .half()将数据类型转换为 float16（半精度）
+            feat_embed = model.encode_image(tiles)  # [b, D]
+        feat_embed /= feat_embed.norm(dim=-1, keepdim=True)     # 将embedding归一化
+        feat_embeds[mode] = feat_embed.detach().cpu().half()    # .half()将数据类型转换为 float16（半精度）
     
     # seg_map_l = {}
     # seg_map_l['l'] = seg_map['l']
-    return clip_embeds, seg_map
+    return feat_embeds, seg_map
 
 # 从原图中提取一个被掩码（mask）指定的目标区域图像，并将背景设为黑色
 def get_seg_img(mask, image):
@@ -328,7 +359,7 @@ def sam_encoder(image):
     # [1,3,H,W] -> [H,W,3], BGR -> RGB
     image = cv2.cvtColor(image[0].permute(1,2,0).numpy().astype(np.uint8), cv2.COLOR_BGR2RGB)
     # pre-compute masks
-    masks_default, masks_s, masks_m, masks_l = mask_generator.generate(image)
+    masks_default, masks_s, masks_m, masks_l = mask_generator.generate(image)   # 像素范围是[0,255]
     # pre-compute postprocess
     masks_default, masks_s, masks_m, masks_l = \
         masks_update(masks_default, masks_s, masks_m, masks_l, iou_thr=0.8, score_thr=0.7, inner_thr=0.5)
@@ -345,6 +376,7 @@ def sam_encoder(image):
 
             seg_map[masks[i]['segmentation']] = i   # 将第 i 个目标的分割区域在 seg_map 中赋值为 i，从而在 seg_map 中标注每个目标的“编号”或“ID”
         seg_imgs = np.stack(seg_img_list, axis=0) # b,224,224,3
+        # 在这里实现 [0， 255] -> [0.0, 1.0]
         seg_imgs = (torch.from_numpy(seg_imgs.astype("float32")).permute(0,3,1,2) / 255.0).to('cuda')   # b,224,224,3 -> b,3,224,224    归一化到[0.0, 1.0]
 
         return seg_imgs, seg_map
@@ -391,7 +423,13 @@ if __name__ == '__main__':
     parser.add_argument('--dataset_path', type=str, required=True)
     parser.add_argument('--resolution', type=int, default=-1)
     parser.add_argument('--sam_ckpt_path', type=str, default="ckpts/sam_vit_h_4b8939.pth")
+    parser.add_argument('--encoder', type=str, default="dino")
     args = parser.parse_args()
+
+    if args.encoder not in ['dino', 'clip']:
+        print('[ ERROR ] Invalid encoder name.')
+        sys.exit(-1)
+    encoder = args.encoder
 
     # 设置默认的浮点数数据类型为 torch.float32（即 32 位浮点数），在没有明确指定 dtype 的情况下，PyTorch 会使用这个默认类型
     # 如果没有设置这个默认类型，有些 PyTorch 版本（尤其在开启 AMP 自动混合精度或使用 float64 时）可能默认是 float64，这样会导致不必要的类型转换或性能损失
@@ -403,8 +441,8 @@ if __name__ == '__main__':
     data_list = os.listdir(img_folder)  # 图像名列表
     data_list.sort()
 
-    # CLIP
-    model = OpenCLIPNetwork(OpenCLIPNetworkConfig)
+    # CLIP或DINO
+    model = OpenCLIPNetwork(OpenCLIPNetworkConfig) if encoder == 'clip' else DINOv2Model(DINOv2ModelConfig)
     # model, preprocess_for_tensor = clip.load("./CLIP/pretrain_models/ViT-B-16.pt", #"./CLIP/pretrain_models/RN50x64.pt", #"./CLIP/pretrain_models/ViT-B-16.pt", #"./CLIP/pretrain_models/RN50x64.pt", #"./CLIP/pretrain_models/ViT-L-14.pt",
     #                                                     device="cuda",
     #                                                     download_root='./CLIP/pretrain_models/',
@@ -455,6 +493,7 @@ if __name__ == '__main__':
     images = [img_list[i].permute(2, 0, 1)[None, ...] for i in range(len(img_list))]
     imgs = torch.cat(images)    # torch.cat(images) 默认在 维度 0（batch 维） 进行拼接
 
-    save_folder = os.path.join(dataset_path, 'language_features')   # xxx/language_features
+    folder_name = 'language_features_clip' if encoder == 'clip' else 'language_features_dino'
+    save_folder = os.path.join(dataset_path, folder_name)
     os.makedirs(save_folder, exist_ok=True)
     create(imgs, data_list, save_folder, dataset_path)

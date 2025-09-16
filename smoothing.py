@@ -1,14 +1,3 @@
-#
-# Copyright (C) 2023, Inria
-# GRAPHDECO research group, https://team.inria.fr/graphdeco
-# All rights reserved.
-#
-# This software is free for non-commercial, research and evaluation use 
-# under the terms of the LICENSE.md file.
-#
-# For inquiries contact  george.drettakis@inria.fr
-#
-
 import os
 os.environ["MKL_NUM_THREADS"] = "12"
 os.environ["NUMEXPR_NUM_THREADS"] = "12"
@@ -116,8 +105,10 @@ def generate_lab_colors(M, device):
     return lab_tensor
 
 def majority_voting(gaussians, scene, pipe, background, dataset, args):
+    folder_name = 'language_features_clip' if args.encoder == 'clip' else 'language_features_dino'
     # 这里 *list 的意思是把列表里的元素依次传入函数
-    lf_path = "/" + os.path.join(*dataset.lf_path.split('/')[:-1], "language_features")
+    lf_path = "/" + os.path.join(*dataset.lf_path.split('/')[:-1], folder_name)
+    feat_dim = 512 if args.encoder == 'clip' else 768
     # if args.use_pq:
     #     voting_mat = -1 * torch.ones((gaussians._opacity.shape[0], 17), dtype=torch.uint8, device="cuda")
     # else:
@@ -142,7 +133,7 @@ def majority_voting(gaussians, scene, pipe, background, dataset, args):
 
     num_masks = torch.sum(num_masks_array)  # 所有图像的feature总数 M
     num_gaussians = len(gaussians.get_opacity)
-    features_array = torch.zeros((num_masks,512), device=gaussians.get_opacity.device)   # [M,512]
+    features_array = torch.zeros((num_masks, feat_dim), device=gaussians.get_opacity.device)   # [M,D]
     allocate_array = torch.zeros((num_gaussians, num_masks), dtype=torch.float32, device=gaussians.get_opacity.device)   # [N,M]
     offset = 0
     for i in tqdm(range(len(viewpoint_stack))):
@@ -545,6 +536,7 @@ if __name__ == "__main__":
     # parser.add_argument("--name_extra", type=str, default = None)
     # parser.add_argument("--mode", type=str, default = "mean")
     parser.add_argument("--topk", type=int, default = 1)
+    parser.add_argument('--encoder', type=str, default="dino")
     
     # parser.add_argument("--use_pq", action="store_true")
     # parser.add_argument("--pq_index", type=str, default=None)
@@ -573,6 +565,10 @@ if __name__ == "__main__":
     #     if args.pq_index is None:
     #         raise ValueError("PQ index file is not provided.")
     #     lp._language_features_name = "language_features_pq"
+
+    if args.encoder not in ['dino', 'clip']:
+        print('[ ERROR ] Invalid encoder name.')
+        sys.exit(-1)
 
     safe_state(args.quiet)
     torch.set_grad_enabled(False)
