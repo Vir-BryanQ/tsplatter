@@ -3,6 +3,7 @@ os.environ["MKL_NUM_THREADS"] = "12"
 os.environ["NUMEXPR_NUM_THREADS"] = "12"
 os.environ["OMP_NUM_THREADS"] = "12"
 import torch
+import time
 from torch_scatter import scatter_max
 import torch.nn.functional as F
 from PIL import Image
@@ -105,6 +106,8 @@ def generate_lab_colors(M, device):
     return lab_tensor
 
 def majority_voting(gaussians, scene, pipe, background, dataset, args):
+    t0 = time.perf_counter()
+
     folder_name = 'language_features_clip' if args.encoder == 'clip' else 'language_features_dino'
     # 这里 *list 的意思是把列表里的元素依次传入函数
     lf_path = "/" + os.path.join(*dataset.lf_path.split('/')[:-1], folder_name)
@@ -125,23 +128,27 @@ def majority_voting(gaussians, scene, pipe, background, dataset, args):
     
     #### code edit ####
     # 对feature进行计数
-    num_masks_array = torch.zeros(len(viewpoint_stack), dtype=torch.int, device=gaussians.get_opacity.device)
+    num_masks_array = torch.zeros(len(viewpoint_stack), dtype=torch.int)
+    feature_map_list = []
+    seg_map_list = []
     for i in range(len(viewpoint_stack)):
         language_feature_name = os.path.join(lf_path, viewpoint_stack[i].image_name)
-        feature_map = torch.from_numpy(np.load(language_feature_name + '_f.npy'))   # [B,D]
+        feature_map = torch.from_numpy(np.load(language_feature_name + '_f.npy')).cuda().half()   # [B,D]
         num_masks_array[i] = feature_map.shape[0]   # 每张图像的feature数
+        feature_map_list.append(feature_map)
 
-    num_masks = torch.sum(num_masks_array)  # 所有图像的feature总数 M
+        seg_map = torch.from_numpy(np.load(language_feature_name + '_s.npy')).type(torch.int64)[dataset.feature_level].unsqueeze(0).cuda() # [1,H,W]
+        seg_map_list.append(seg_map)
+
+    features_array = torch.cat(feature_map_list, dim=0)     # [M,D]
+    seg_maps = torch.cat(seg_map_list, dim=0)
+
+    num_masks = features_array.shape[0]  # 所有图像的feature总数 M
     num_gaussians = len(gaussians.get_opacity)
-    features_array = torch.zeros((num_masks, feat_dim), device=gaussians.get_opacity.device)   # [M,D]
-    allocate_array = torch.zeros((num_gaussians, num_masks), dtype=torch.float32, device=gaussians.get_opacity.device)   # [N,M]
+    allocate_array = torch.zeros((num_gaussians, num_masks), dtype=torch.float16, device=gaussians.get_opacity.device)   # [N,M]
     offset = 0
     for i in tqdm(range(len(viewpoint_stack))):
         viewpoint_cam = viewpoint_stack[i]
-        language_feature_name = os.path.join(lf_path, viewpoint_cam.image_name)
-        feature_map = torch.from_numpy(np.load(language_feature_name + '_f.npy'))   # [B,D]
-        features_array[offset:offset+num_masks_array[i]] = feature_map  # 所有图像的feature
-        
         render_pkg = count_render(viewpoint_cam, gaussians, pipe, background)
         ids, contribution = (
             # [H,W,100]
@@ -152,7 +159,7 @@ def majority_voting(gaussians, scene, pipe, background, dataset, args):
         # self._feature_level = -1
         # ParamGroup中对下划线进行了处理
         # # 0:default 1:s 2:m 3:l
-        seg_map = torch.from_numpy(np.load(language_feature_name + '_s.npy')).type(torch.int64)[dataset.feature_level].unsqueeze(0).cuda() # [1,H,W]
+        seg_map = seg_maps[i:i + 1] # [1,H,W]
         seg_map_bool = seg_map != -1    # bool [1,H,W]
         seg_map += offset   # 保证seg_map中的索引与features_array一致
 
@@ -182,15 +189,13 @@ def majority_voting(gaussians, scene, pipe, background, dataset, args):
         weights = weights[valid_mask]
         gt_segmentations = gt_segmentations[valid_mask]
 
-        ray_ids = ray_ids.type(torch.int64)
-
         # weight_sum = torch.zeros(num_gaussians)
         # 以下划线结尾代表原地操作
         # tensor.index_put_(indices, values, accumulate=False)用于通过索引将新的值填充到原始张量中的指定位置
         # indices：一个包含索引的元组，指定了在哪些位置进行赋值操作。它通常是一个包含多个张量的元组，每个张量代表一个维度上的索引
         # 一个张量，包含你想要放置在 indices 指定位置的值。这个张量的形状必须与 indices 所指定的位置一致
         # accumulate：一个布尔值，表示是否对指定位置的元素进行累加，False的话就直接赋值
-        allocate_array.index_put_((ray_ids, gt_segmentations), weights, accumulate=True)
+        allocate_array.index_put_((ray_ids, gt_segmentations), weights.half(), accumulate=True)
 
         offset += num_masks_array[i]
 
@@ -208,8 +213,11 @@ def majority_voting(gaussians, scene, pipe, background, dataset, args):
     # allocate_array[reweight_index][allocate_array[reweight_index]>0] = 1    # 不会起作用
 
     # 对所有feature进行加权求和
-    averaged_tensor = torch.matmul(allocate_array.type(torch.float32), features_array)
+    averaged_tensor = torch.matmul(allocate_array, features_array)
     averaged_tensor /= (averaged_tensor.norm(dim=-1, keepdim=True) + 1e-9)  # 归一化
+
+    t1 = time.perf_counter()
+    print(f"majority_voting: {(t1 - t0) * 1000:.3f} ms")
 
     # if args.use_pq:
     #     index = faiss.read_index(args.pq_index)
@@ -233,7 +241,12 @@ def majority_voting(gaussians, scene, pipe, background, dataset, args):
         
     return averaged_tensor
 
-def cosine_similarity_clustering(features, threshold=0.95, block_size=50000):
+# block_size 小 → 矩阵更小，显存带宽压力小，cache 友好，Python 循环处理量也小 → 更快
+# block_size 太大 → 矩阵乘法结果过大，显存和布尔运算开销拖慢速度
+# block_size 太小 → kernel 启动开销 + Python 循环过多 → 也会变慢
+def cosine_similarity_clustering(features, threshold=0.83, block_size=2000):
+    t0 = time.perf_counter()
+
     N = features.shape[0]
     device = features.device
     free_mask = torch.ones(N, dtype=torch.bool, device=device) # [N]
@@ -244,19 +257,23 @@ def cosine_similarity_clustering(features, threshold=0.95, block_size=50000):
         end = start + N1
         features_sampled = features[start:end]    # [N1, D]
         sim_mask = (features_sampled @ features.T) > threshold   # [N1, N]
-        s = sim_mask
+        s = sim_mask[free_mask[start:end]]      # Not: s = sim_mask 
         while s.shape[0] > 0:
             grp_mask = s[0] & free_mask     # [N]
             cluster_ids[grp_mask] = cluster_id
+            t = free_mask.clone()[start:end]
             free_mask[grp_mask] = False
             cluster_id += 1
             s = sim_mask[free_mask[start:end]]
-        del sim_mask
-        gc.collect()
+
+    t1 = time.perf_counter()
+    print(f"cosine_similarity_clustering: {(t1 - t0) * 1000:.3f} ms   {cluster_id} groups")
 
     return cluster_ids
         
-def compute_significant_mask(contribution, ids, N, max_threshold=0.1, block_size=10000, use_max_weight=True, sum_threshold=3):
+def compute_significant_mask(contribution, ids, N, max_threshold=0.1, use_max_weight=True, sum_threshold=3):
+    t0 = time.perf_counter()
+
     device = contribution.device
     if use_max_weight:
         per_gauss_contrib = torch.zeros(N, device=device, dtype=contribution.dtype)  # [N]
@@ -277,6 +294,9 @@ def compute_significant_mask(contribution, ids, N, max_threshold=0.1, block_size
         ids = ids[valid_mask]
         per_gauss_contrib.index_put_((ids,), contribution, accumulate=True)
         significant_mask = per_gauss_contrib > sum_threshold  # [N]
+    
+    t1 = time.perf_counter()
+    print(f"compute_significant_mask: {(t1 - t0) * 1000:.3f} ms")
 
     return significant_mask
 
@@ -285,6 +305,7 @@ def laplacian_smoothing(gaussians, cluster_ids, full_significant_mask, lambda_re
     # colors = torch.zeros((N, 3), device=full_significant_mask.device, dtype=torch.float32)
     # colors[full_significant_mask] = torch.ones((full_significant_mask.sum().item(), 3), device=full_significant_mask.device, dtype=torch.float32)
     # return torch.logit(colors, eps=1e-10)
+    t0 = time.perf_counter()
 
     N = gaussians.get_thermal_features.shape[0]
     device = gaussians.get_thermal_features.device
@@ -295,14 +316,19 @@ def laplacian_smoothing(gaussians, cluster_ids, full_significant_mask, lambda_re
     retain_mask = torch.ones(N, device=device, dtype=torch.bool)
 
     for cluster_id in unique_cluster_ids:
+        # 如果在循环里频繁 gc.collect()，几乎等于每一步都在做“冷启动”，完全失去了 PyTorch 缓存的优势    1ms -> 600ms
         indices = torch.where(cluster_ids == cluster_id)[0] # [M]
+
+        # colors[indices] = generate_lab_colors(indices.shape[0], indices.device)
+        # continue
+
         significant_mask = full_significant_mask[indices]    # [M]
 
         known_colors = colors[indices][significant_mask]  # [M1,3]
         M1 = known_colors.shape[0]
         if M1 == 0:
             # retain_mask[indices] = False
-            print('Warning: there is no known color in a group')
+            # print('Warning: there is no known color in a group')
             continue
         non_significant_mask = ~significant_mask    # [M]
 
@@ -315,9 +341,6 @@ def laplacian_smoothing(gaussians, cluster_ids, full_significant_mask, lambda_re
         weights = 1 / (euclidean_dists + 1e-9)  # [M,M]  
         # weights = 1 / (euclidean_dists * euclidean_dists + 1e-9)  # [M,M]  
 
-        del euclidean_dists
-        gc.collect()
-
         graph_mask = torch.zeros((M, M), device=device, dtype=torch.bool)     # [M,M]
         graph_mask.scatter_(1, knn_idx, True)
         graph_mask = graph_mask | graph_mask.T  # [M,M]
@@ -325,18 +348,12 @@ def laplacian_smoothing(gaussians, cluster_ids, full_significant_mask, lambda_re
         graph_mask.fill_diagonal_(0)
         adj_matrix = torch.zeros((M, M), device=device, dtype=torch.float32)     # [M,M]
         adj_matrix[graph_mask] = weights[graph_mask]
-        del weights, graph_mask
-        gc.collect()
 
         degree_matrix = torch.diag(adj_matrix.sum(dim=1))
         laplacian_matrix = degree_matrix - adj_matrix
-        del degree_matrix, adj_matrix
-        gc.collect()
 
         L_ii = laplacian_matrix[non_significant_mask, :][:, non_significant_mask]  # [M2,M2]
         L_ij = laplacian_matrix[non_significant_mask, :][:, significant_mask]  # [M2,M1]
-        del laplacian_matrix
-        gc.collect()
 
         rhs = -torch.mm(L_ij, known_colors)  # [M2,3]
         lhs = L_ii + lambda_reg * torch.eye(L_ii.shape[0], device=device)   # [M2,M2]
@@ -345,13 +362,11 @@ def laplacian_smoothing(gaussians, cluster_ids, full_significant_mask, lambda_re
             smooth_unknown_colors = torch.linalg.solve(lhs, rhs)    # [M2,3]
         except torch.linalg.LinAlgError:
             # 病态矩阵
-            print('Warning: the input matrix is singular')
+            # print('Warning: the input matrix is singular')
             smooth_unknown_colors = torch.linalg.lstsq(lhs, rhs)[0]
 
-        del L_ii, L_ij
-        gc.collect()
-
         colors[indices[non_significant_mask]] = smooth_unknown_colors
+
         # colors[indices[non_significant_mask]] = rgb_to_lab(torch.ones_like(smooth_unknown_colors))
 
         # known_features = thermal_features[indices][significant_mask]  # [M1,K,3]
@@ -378,11 +393,16 @@ def laplacian_smoothing(gaussians, cluster_ids, full_significant_mask, lambda_re
         # gc.collect()
 
         # thermal_features[indices][non_significant_mask] = smooth_unknown_features
+    
+    t1 = time.perf_counter()
+    print(f"laplacian_smoothing: {(t1 - t0) * 1000:.3f} ms")
 
     # return thermal_features
     return  torch.logit(lab_to_rgb(colors), eps=1e-10), retain_mask  # [N,3]
 
 def temperature_propagation(gaussians, scene, pipe, background, dataset, args):
+    t0 = time.perf_counter()
+
     num_gaussians = len(gaussians.get_opacity)
     viewpoint_stack = scene.getTestCameras().copy()
     ids_list = []
@@ -405,12 +425,17 @@ def temperature_propagation(gaussians, scene, pipe, background, dataset, args):
     # thermal_features = laplacian_smoothing(gaussians, cluster_ids, significant_mask)
     thermal_colors, retain_mask = laplacian_smoothing(gaussians, cluster_ids, significant_mask)
 
+    t1 = time.perf_counter()
+    print(f"temperature_propagation: {(t1 - t0) * 1000:.3f} ms")
+
     # return thermal_features
     return thermal_colors, retain_mask
     
 # training(lp.extract(args), op.extract(args), pp.extract(args), 
 # args.test_iterations, args.save_iterations, args.checkpoint_iterations, args.start_checkpoint, args.debug_from, args)
 def smoothing(dataset, opt, pipe, checkpoint, args):
+    t0 = time.perf_counter()
+
     gaussians = GaussianModel(dataset.sh_degree)    # 简单地给所有属性赋空值
     scene = Scene(dataset, gaussians)
     
@@ -480,6 +505,9 @@ def smoothing(dataset, opt, pipe, checkpoint, args):
     # os.rename(checkpoint, new_checkpoint)
     os.remove(checkpoint)
     torch.save(ckpt, checkpoint)
+
+    t1 = time.perf_counter()
+    print(f"Total: {(t1 - t0) * 1000:.3f} ms")
     
     # iteration = 0
 
@@ -526,7 +554,7 @@ if __name__ == "__main__":
     parser.add_argument('--ip', type=str, default="127.0.0.1")
     parser.add_argument('--port', type=int, default=55555)
     # parser.add_argument('--debug_from', type=int, default=-1)
-    parser.add_argument('--detect_anomaly', action='store_true', default=False)
+    # parser.add_argument('--detect_anomaly', action='store_true', default=False)
     # parser.add_argument("--test_iterations", nargs="+", type=int, default=[0])
     # parser.add_argument("--save_iterations", nargs="+", type=int, default=[0])
     parser.add_argument("--quiet", action="store_true")
@@ -578,7 +606,7 @@ if __name__ == "__main__":
     # 在 PyTorch 中，autograd 会记录运算过程并自动求导。有时候在反向传播（loss.backward()）时，会遇到 NaN、inf 或非法操作，但报错信息并不会直接告诉你是在哪个算子里出的问题，调试起来很麻烦
     # 调用 torch.autograd.set_detect_anomaly(True) 后，PyTorch 会在反向传播时逐步检查每个算子 的梯度计算，一旦发现 NaN 或 inf，就会立刻报错，并指出具体是在哪个算子里出现的异常
     # 开启 anomaly detection 会显著降低训练速度（因为要逐步检查每一步运算），通常只在 调试阶段 使用，定位问题后应关闭
-    torch.autograd.set_detect_anomaly(args.detect_anomaly)
+    # torch.autograd.set_detect_anomaly(args.detect_anomaly)
     smoothing(lp.extract(args), op.extract(args), pp.extract(args), args.start_checkpoint, args)
 
     # All done
