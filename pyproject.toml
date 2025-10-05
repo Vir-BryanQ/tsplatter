@@ -16,7 +16,7 @@ dependencies = [
     "torch",
     # required for dsine normal network
     "geffnet",
-    "rerun-sdk",
+    # "rerun-sdk",
     "pyrender",
 ]
 

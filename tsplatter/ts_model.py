@@ -1,4 +1,5 @@
 import sys
+import os
 import math
 import random
 from dataclasses import dataclass, field
@@ -12,6 +13,7 @@ import numpy as np
 import torch, gc
 import torch.nn.functional as F
 import torchvision.transforms.functional as TF
+import torchvision.utils as vutils
 from torch import Tensor
 from torch.nn import Parameter
 from torchmetrics.image import PeakSignalNoiseRatio, StructuralSimilarityIndexMeasure
@@ -37,6 +39,7 @@ from nerfstudio.engine.callbacks import (
 from nerfstudio.engine.optimizers import Optimizers
 from nerfstudio.models.splatfacto import (
     RGB2SH,
+    SH2RGB,
     SplatfactoModel,
     SplatfactoModelConfig,
     get_viewmat,
@@ -193,6 +196,7 @@ class TSplatterModelConfig(SplatfactoModelConfig):
     # stop_split_at: int = 15000
     stop_split_at: int = 150
     """stop splitting at this step"""
+    # sh_degree: int = 4
     sh_degree: int = 0
     """maximum degree of spherical harmonics to use"""
     use_scale_regularization: bool = False
@@ -229,7 +233,7 @@ class TSplatterModelConfig(SplatfactoModelConfig):
     use_rgb_loss: bool = True
     disable_refinement: bool = False
     use_vanilla_sh: bool = False
-    use_merge_sparsification: bool = True # disable_refinement should be False
+    use_merge_sparsification: bool = False # disable_refinement should be False
     stop_merge_at: int = 150
 
 class TSplatterModel(SplatfactoModel):
@@ -278,6 +282,7 @@ class TSplatterModel(SplatfactoModel):
             near_plane=0.01,
             far_plane=1e10,
             render_mode="ED",
+            # render_mode="RGB+ED",
             sh_degree=sh_degree_to_use,
             sparse_grad=False,
             absgrad=True,
@@ -285,6 +290,22 @@ class TSplatterModel(SplatfactoModel):
             # set some threshold to disregrad small gaussians for faster rendering.
             # radius_clip=3.0,
         )
+
+        # background =  torch.zeros(3).cuda()
+        # rgb = depth_im[:, ..., :3] + (1 - alpha) * background
+        # rgb = torch.clamp(rgb, 0.0, 1.0)
+
+        # save_dir = "/home/24-qiuhaohua/tmp/rgb"
+        # images = rgb.detach().cpu()   # 先转到CPU
+        # images = (images * 255).clamp(0, 255).to(torch.uint8)  # 假设原本是0~1范围
+
+        # for i in range(images.shape[0]):
+        #     img = images[i]  # [H, W, 3]
+        #     # 需要把 [H, W, 3] 转成 [3, H, W]，因为 save_image 要求通道在前
+        #     img_chw = img.permute(2, 0, 1)
+        #     vutils.save_image(img_chw.float() / 255.0, os.path.join(save_dir, f"img_{i:04d}.png"))
+        # sys.exit(0)
+
         depth_im = torch.where(alpha > 0, depth_im, depth_im.detach().max()).permute(0, 2, 1, 3)    # [C,W,H,1]
 
         world_points = unproject_depth_to_world(depth_im=depth_im, Ks=Ks, viewmats=viewmats)    # [C,W,H,3]
@@ -941,7 +962,6 @@ class TSplatterModel(SplatfactoModel):
         for group, param in param_groups.items():
             self.merge_in_optim(optimizers.optimizers[group], param, n)
 
-
     def quat_to_rotmat(self, q):
         q = F.normalize(q, dim=-1)
         qw, qx, qy, qz = q.unbind(-1)
@@ -1033,7 +1053,6 @@ class TSplatterModel(SplatfactoModel):
             del mu_i_blk, mu_j_blk, Sigma_i_blk, Sigma_j_blk
             del alpha_i_blk, alpha_j_blk, f_i_blk, f_j_blk
             del mu_i_outer, mu_j_outer, mu_new_blk, Sigma_new_blk, alpha_new_blk, f_new_blk
-            gc.collect()
 
         # 拼接分块结果
         mu_new = torch.cat(mu_new_list, dim=0)
@@ -1071,7 +1090,6 @@ class TSplatterModel(SplatfactoModel):
             knn_idx_list.append(knn_idx)
 
             del euclidean_dists
-            gc.collect()
 
         knn_idx = torch.cat(knn_idx_list, dim=0)    # [M,k+1]
 
@@ -1168,11 +1186,10 @@ class TSplatterModel(SplatfactoModel):
         if self.config.disable_refinement:
             return 
 
-        if self.step <= self.config.warmup_length or self.step > self.config.stop_merge_at:
-            # 训练开始阶段不进行refinement
-            return
-
         if self.config.use_merge_sparsification:
+            if self.step <= self.config.warmup_length or self.step > self.config.stop_merge_at:
+                return
+
             avg_grad_norm = (self.xys_grad_norm / self.vis_counts) * 0.5 * max(self.last_size[0], self.last_size[1])
             merges = (avg_grad_norm < self.config.densify_grad_thresh).squeeze()
             merge_params, merges_mask = self.merge_gaussians(merges)

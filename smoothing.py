@@ -261,7 +261,6 @@ def cosine_similarity_clustering(features, threshold=0.83, block_size=2000):
         while s.shape[0] > 0:
             grp_mask = s[0] & free_mask     # [N]
             cluster_ids[grp_mask] = cluster_id
-            t = free_mask.clone()[start:end]
             free_mask[grp_mask] = False
             cluster_id += 1
             s = sim_mask[free_mask[start:end]]
@@ -301,10 +300,6 @@ def compute_significant_mask(contribution, ids, N, max_threshold=0.1, use_max_we
     return significant_mask
 
 def laplacian_smoothing(gaussians, cluster_ids, full_significant_mask, lambda_reg=1e-3, k_neighbors=100_000_000):
-    # N = gaussians.get_thermal_features.shape[0]
-    # colors = torch.zeros((N, 3), device=full_significant_mask.device, dtype=torch.float32)
-    # colors[full_significant_mask] = torch.ones((full_significant_mask.sum().item(), 3), device=full_significant_mask.device, dtype=torch.float32)
-    # return torch.logit(colors, eps=1e-10)
     t0 = time.perf_counter()
 
     N = gaussians.get_thermal_features.shape[0]
@@ -338,8 +333,8 @@ def laplacian_smoothing(gaussians, cluster_ids, full_significant_mask, lambda_re
 
         euclidean_dists = torch.cdist(means, means)   # [M,M]
         knn_idx = euclidean_dists.topk(k + 1, largest=False).indices   # [M,k+1]
-        weights = 1 / (euclidean_dists + 1e-9)  # [M,M]  
-        # weights = 1 / (euclidean_dists * euclidean_dists + 1e-9)  # [M,M]  
+        # weights = 1 / (euclidean_dists + 1e-9)  # [M,M]  
+        weights = 1 / (torch.pow(euclidean_dists, 2) + 1e-9)  # [M,M]  
 
         graph_mask = torch.zeros((M, M), device=device, dtype=torch.bool)     # [M,M]
         graph_mask.scatter_(1, knn_idx, True)
