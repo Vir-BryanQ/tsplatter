@@ -230,8 +230,8 @@ class TSplatterModelConfig(SplatfactoModelConfig):
     normal_lambda: float = 0.1
     """Regularizer for normal loss"""
     use_scale_loss: bool = False
-    use_rgb_loss: bool = True
-    disable_refinement: bool = False
+    use_rgb_loss: bool = False
+    disable_refinement: bool = True
     use_vanilla_sh: bool = False
     use_merge_sparsification: bool = False # disable_refinement should be False
     stop_merge_at: int = 150

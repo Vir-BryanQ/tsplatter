@@ -1,0 +1,52 @@
+{
+    "Dimsum": {
+        "psnr": 26.94,
+        "ssim": 0.890,
+        "lpips": 0.121
+    },
+    "DailyStuff": {
+        "psnr": 22.28,
+        "ssim": 0.835,
+        "lpips": 0.208
+    },
+    "Ebike": {
+        "psnr": 23.31,
+        "ssim": 0.862,
+        "lpips": 0.203
+    },
+    "RoadBlock": {
+        "psnr": 27.17,
+        "ssim": 0.919,
+        "lpips": 0.198
+    },
+    "Truck": {
+        "psnr": 26.27,
+        "ssim": 0.880,
+        "lpips": 0.133
+    },
+    "RotaryKiln": {
+        "psnr": 27.15,
+        "ssim": 0.926,
+        "lpips": 0.124
+    },
+    "Parterre": {
+        "psnr": 26.16,
+        "ssim": 0.883,
+        "lpips": 0.181
+    },
+    "IronIngot": {
+        "psnr": 30.41,
+        "ssim": 0.898,
+        "lpips": 0.086
+    },
+    "LandScape": {
+        "psnr": 22.27,
+        "ssim": 0.850,
+        "lpips": 0.248
+    },
+    "Building": {
+        "psnr": 26.83,
+        "ssim": 0.897,
+        "lpips": 0.177
+    }
+}

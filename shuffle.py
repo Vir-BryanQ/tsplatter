@@ -10,6 +10,7 @@ import signal
 import time
 from datetime import datetime
 import psutil
+import uuid
 
 def send_signal_to_process_and_children(pid):
     # 获取父进程对象
@@ -27,6 +28,8 @@ def parse_arguments():
     parser.add_argument('--num_loops', type=int, required=True, help='Number of loops to run')
     parser.add_argument('--sampling_ratio', type=int, required=True, help='Sampling ratio for the training set')
     parser.add_argument('--output_excel', type=str, required=True, help='Name of the output Excel file')
+    parser.add_argument('--scene_name', type=str, required=True, help='Name of the scene')
+    parser.add_argument('--metric_json', type=str, required=True, help='Path to the metric JSON file')
     return parser.parse_args()
 
 
@@ -35,13 +38,27 @@ def get_file_list(dataset_path):
     with open(file_list_path, 'r') as f:
         return [line.strip() for line in f.read().splitlines() if line.strip()]
 
+def is_empty_dir(path):
+    return os.path.isdir(path) and len(os.listdir(path)) == 0
 
-def perform_sampling(dataset_path, num_loops, sampling_ratio, output_excel):
+
+def perform_sampling(dataset_path, num_loops, sampling_ratio, output_excel, scene_name, metric_json):
+    with open(metric_json, 'r') as f:
+        metric = json.load(f)
+    psnr_in_paper = metric[scene_name]['psnr']
+    ssim_in_paper = metric[scene_name]['ssim']
+    lpips_in_paper = metric[scene_name]['lpips']
+
     file_list = get_file_list(dataset_path)
     previous_train_sets = set()  # 存储之前所有的训练集
     
     output_data = []
 
+    unique_id = str(uuid.uuid4())
+    dataset_name = os.path.basename(dataset_path.rstrip('/'))
+    tsplatter_dir = os.path.join(f"outputs/{dataset_name}/{unique_id}/{dataset_name}/tsplatter/")
+    os.makedirs(tsplatter_dir, exist_ok=True)
+    prev_latest_dir = ''
     for loop in range(num_loops):
         # Sample training set
         train_set_size = len(file_list) // sampling_ratio
@@ -71,18 +88,23 @@ def perform_sampling(dataset_path, num_loops, sampling_ratio, output_excel):
                 f.write(f"{item}\n")
 
         # Execute training command
-        process = subprocess.Popen(f"ns-train tsplatter --data {dataset_path}", shell=True, env=os.environ)
-        time.sleep(30)
+        process = subprocess.Popen(f"ns-train tsplatter --data {dataset_path} --output-dir outputs/{dataset_name}/{unique_id}", shell=True, env=os.environ)
+        while is_empty_dir(tsplatter_dir):
+            time.sleep(1)
         
         # Find the latest trained directory
-        daily_stuff_dir = os.path.basename(dataset_path.rstrip('/'))
-        tsplatter_dir = os.path.join(f"outputs/{daily_stuff_dir}/tsplatter/")
         latest_dir = max([d for d in os.listdir(tsplatter_dir) if os.path.isdir(os.path.join(tsplatter_dir, d))], key=lambda x: datetime.strptime(x, '%Y-%m-%d_%H%M%S'))
+        while latest_dir == prev_latest_dir:
+            time.sleep(1)
+            latest_dir = max([d for d in os.listdir(tsplatter_dir) if os.path.isdir(os.path.join(tsplatter_dir, d))], key=lambda x: datetime.strptime(x, '%Y-%m-%d_%H%M%S'))
+
+        prev_latest_dir = latest_dir
+
         checkpoint_path = os.path.join(tsplatter_dir, latest_dir, 'nerfstudio_models', 'step-000000299.ckpt')
 
         while True:
             if os.path.exists(checkpoint_path):  # 如果文件存在
-                time.sleep(3)
+                time.sleep(5)
                 send_signal_to_process_and_children(process.pid)
                 process.wait()
                 break  # 退出循环
@@ -137,6 +159,7 @@ def perform_sampling(dataset_path, num_loops, sampling_ratio, output_excel):
 
         # Write results to Excel file
         output_data.append([
+            psnr_in_paper, ssim_in_paper, lpips_in_paper,
             psnr, ssim, lpips,
             psnr1, ssim1, lpips1,
             delta_psnr, delta_ssim, delta_lpips,
@@ -145,6 +168,7 @@ def perform_sampling(dataset_path, num_loops, sampling_ratio, output_excel):
 
     # Save the data to Excel
     df = pd.DataFrame(output_data, columns=[
+        'psnr in paper', 'ssim in paper', 'lpips in paper',
         'psnr', 'ssim', 'lpips', 'psnr1', 'ssim1', 'lpips1', 
         'delta_psnr', 'delta_ssim', 'delta_lpips', 'train_set_images'
     ])
@@ -155,4 +179,4 @@ def perform_sampling(dataset_path, num_loops, sampling_ratio, output_excel):
 
 if __name__ == '__main__':
     args = parse_arguments()
-    perform_sampling(args.dataset_path, args.num_loops, args.sampling_ratio, args.output_excel)
+    perform_sampling(args.dataset_path, args.num_loops, args.sampling_ratio, args.output_excel, args.scene_name, args.metric_json)
