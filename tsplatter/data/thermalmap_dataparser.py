@@ -36,6 +36,7 @@ MAX_AUTO_RESOLUTION = 1600
 class ThermalMapDataParserConfig(ColmapDataParserConfig):
     _target: Type = field(default_factory=lambda: ThermalMapDataParser)
     rgb_ckpt_path: Path = Path("RGB_Scene.ckpt")
+    train_list_file: Optional[Path] = None
 
 class ThermalMapDataParser(ColmapDataParser):
     config: ThermalMapDataParserConfig
@@ -66,6 +67,25 @@ class ThermalMapDataParser(ColmapDataParser):
             return gauss_params
 
     def _get_image_indices(self, image_filenames, split):
+        if self.config.train_list_file is not None and split == 'train':
+            CONSOLE.log(f"Using {self.config.train_list_file} to get indices for split {split}.")
+            with (self.config.data / "train_lists" / f"{self.config.train_list_file}").open("r", encoding="utf8") as f:
+                filenames = [line for line in f.read().splitlines() if line.strip()]
+            # Validate split first
+            split_filenames = set(self.config.data / self.config.images_path / x for x in filenames)
+
+            # 检测 split_filenames 中的文件名是否在 image_filenames 中存在
+            unmatched_filenames = split_filenames.difference(image_filenames)   # 找出在 split_filenames 中 存在，但在 image_filenames 中 不存在 的文件名，即集合差值A - B
+            if unmatched_filenames:
+                raise RuntimeError(
+                    f"Some filenames for split {split} were not found: {set(map(str, unmatched_filenames))}."
+                )
+
+            indices = [i for i, path in enumerate(image_filenames) if path in split_filenames]  # 使用图像image_filenames中的索引
+            CONSOLE.log(f"[yellow] Dataset is overriding {split}_indices to {indices}")
+            indices = np.array(indices, dtype=np.int32)
+            return indices
+
         has_split_files_spec = (
             (self.config.data / "train_list.txt").exists()
             or (self.config.data / "test_list.txt").exists()

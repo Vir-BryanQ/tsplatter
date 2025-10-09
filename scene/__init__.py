@@ -22,7 +22,7 @@ class Scene:
 
     gaussians : GaussianModel
 
-    def __init__(self, args : ModelParams, gaussians : GaussianModel, load_iteration=None, shuffle=True, resolution_scales=[1.0]):
+    def __init__(self, args : ModelParams, gaussians : GaussianModel, load_iteration=None, shuffle=True, resolution_scales=[1.0], train_list_file=None):
         """b
         :param path: Path to colmap scene main folder.
         """
@@ -40,7 +40,7 @@ class Scene:
         self.train_cameras = {}
         self.test_cameras = {}
 
-        scene_info = sceneLoadTypeCallbacks["Colmap"](args.source_path, args.images, args.eval)
+        scene_info = sceneLoadTypeCallbacks["Colmap"](args.source_path, args.images, args.eval, train_list_file=train_list_file)
         # if os.path.exists(os.path.join(args.source_path, "sparse")):
             # scene_info = SceneInfo(point_cloud=pcd,
             #                train_cameras=train_cam_infos,

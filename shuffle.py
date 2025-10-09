@@ -11,6 +11,7 @@ import time
 from datetime import datetime
 import psutil
 import uuid
+from tqdm import tqdm
 
 def send_signal_to_process_and_children(pid):
     # 获取父进程对象
@@ -34,7 +35,7 @@ def parse_arguments():
 
 
 def get_file_list(dataset_path):
-    file_list_path = os.path.join(dataset_path, 'full_list.txt')
+    file_list_path = os.path.join(dataset_path, 'full_train_list.txt')
     with open(file_list_path, 'r') as f:
         return [line.strip() for line in f.read().splitlines() if line.strip()]
 
@@ -58,10 +59,11 @@ def perform_sampling(dataset_path, num_loops, sampling_ratio, output_excel, scen
     dataset_name = os.path.basename(dataset_path.rstrip('/'))
     tsplatter_dir = os.path.join(f"outputs/{dataset_name}/{unique_id}/{dataset_name}/tsplatter/")
     os.makedirs(tsplatter_dir, exist_ok=True)
+    train_list_path = os.path.join(dataset_path, 'train_lists', f'train_list_{unique_id}.txt')
     prev_latest_dir = ''
-    for loop in range(num_loops):
+    for loop in tqdm(range(num_loops)):
         # Sample training set
-        train_set_size = len(file_list) // sampling_ratio
+        train_set_size = round(len(file_list) * (sampling_ratio / 100))
         random.shuffle(file_list)
         train_set = set(file_list[:train_set_size])
 
@@ -72,23 +74,13 @@ def perform_sampling(dataset_path, num_loops, sampling_ratio, output_excel, scen
 
         previous_train_sets.add(frozenset(train_set))  # Add the current train set to the history
 
-        test_set = set(file_list) - train_set
-        
         # Save file names to respective text files
-        with open(os.path.join(dataset_path, 'train_list.txt'), 'w') as f:
+        with open(train_list_path, 'w') as f:
             for item in train_set:
                 f.write(f"{item}\n")
         
-        with open(os.path.join(dataset_path, 'test_list.txt'), 'w') as f:
-            for item in test_set:
-                f.write(f"{item}\n")
-        
-        with open(os.path.join(dataset_path, 'val_list.txt'), 'w') as f:
-            for item in test_set:
-                f.write(f"{item}\n")
-
         # Execute training command
-        process = subprocess.Popen(f"ns-train tsplatter --data {dataset_path} --output-dir outputs/{dataset_name}/{unique_id}", shell=True, env=os.environ)
+        process = subprocess.Popen(f"ns-train tsplatter --data {dataset_path} --output-dir outputs/{dataset_name}/{unique_id} thermalmap --train-list-file train_list_{unique_id}.txt", shell=True, env=os.environ)
         while is_empty_dir(tsplatter_dir):
             time.sleep(1)
         
@@ -133,7 +125,7 @@ def perform_sampling(dataset_path, num_loops, sampling_ratio, output_excel, scen
         shutil.move(checkpoint_path, origin_dir)
 
         # Execute smoothing command
-        smoothing_command = f"python smoothing.py -s {dataset_path} --start_checkpoint {checkpoint_path} --feature_level 0 --topk 45 --encoder dino"
+        smoothing_command = f"python smoothing.py -s {dataset_path} --start_checkpoint {checkpoint_path} --feature_level 0 --topk 45 --encoder dino --train_list_file train_list_{unique_id}.txt"
         subprocess.run(smoothing_command, shell=True, env=os.environ)
 
         # Execute evaluation command again for smoothed results

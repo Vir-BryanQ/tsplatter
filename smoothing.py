@@ -432,7 +432,7 @@ def smoothing(dataset, opt, pipe, checkpoint, args):
     t0 = time.perf_counter()
 
     gaussians = GaussianModel(dataset.sh_degree)    # 简单地给所有属性赋空值
-    scene = Scene(dataset, gaussians)
+    scene = Scene(dataset, gaussians, train_list_file=args.train_list_file)
     
     # gaussians.training_setup(opt)
 
@@ -554,12 +554,13 @@ if __name__ == "__main__":
     # parser.add_argument("--save_iterations", nargs="+", type=int, default=[0])
     parser.add_argument("--quiet", action="store_true")
     # parser.add_argument("--checkpoint_iterations", nargs="+", type=int, default=[0])
-    parser.add_argument("--start_checkpoint", type=str, default = None)
+    parser.add_argument("--start_checkpoint", type=str, default=None)
     
     # parser.add_argument("--name_extra", type=str, default = None)
     # parser.add_argument("--mode", type=str, default = "mean")
     parser.add_argument("--topk", type=int, default = 1)
     parser.add_argument('--encoder', type=str, default="dino")
+    parser.add_argument('--train_list_file', type=str, default=None)
     
     # parser.add_argument("--use_pq", action="store_true")
     # parser.add_argument("--pq_index", type=str, default=None)

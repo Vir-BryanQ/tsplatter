@@ -176,7 +176,9 @@ def storePly(path, xyz, rgb):
     ply_data = PlyData([vertex_element])
     ply_data.write(path)
 
-def readColmapSceneInfo(path, images, eval, llffhold=8, orientation_method="up", center_method="poses", auto_scale_poses=True, scale_factor=1.0, assume_colmap_world_coordinate_convention=True):
+def readColmapSceneInfo(path, images, eval, llffhold=8, 
+                        orientation_method="up", center_method="poses", auto_scale_poses=True, scale_factor=1.0, assume_colmap_world_coordinate_convention=True, 
+                        train_list_file=None):
     try:
         cameras_extrinsic_file = os.path.join(path, "images.bin")
         cameras_intrinsic_file = os.path.join(path, "cameras.bin")
@@ -274,8 +276,12 @@ def readColmapSceneInfo(path, images, eval, llffhold=8, orientation_method="up",
     # 按图像名排序
     cam_infos = sorted(cam_infos_unsorted.copy(), key = lambda x : x.image_name)
 
-    with (Path(path) / "train_list.txt").open("r", encoding="utf8") as f:
-        filenames = [line.strip() for line in f.read().splitlines() if line.strip()]
+    if train_list_file is not None:
+        with (Path(path) / "train_lists" / f"{train_list_file}").open("r", encoding="utf8") as f:
+            filenames = [line.strip() for line in f.read().splitlines() if line.strip()]
+    else:
+        with (Path(path) / "train_list.txt").open("r", encoding="utf8") as f:
+            filenames = [line.strip() for line in f.read().splitlines() if line.strip()]
     image_filenames = [image.name for image in cam_extrinsics.values()]
 
     # 检测 split_filenames 中的文件名是否在 image_filenames 中存在
