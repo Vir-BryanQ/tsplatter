@@ -46,9 +46,13 @@ def is_empty_dir(path):
 def perform_sampling(dataset_path, num_loops, sampling_ratio, output_excel, scene_name, metric_json):
     with open(metric_json, 'r') as f:
         metric = json.load(f)
-    psnr_in_paper = metric[scene_name]['psnr']
-    ssim_in_paper = metric[scene_name]['ssim']
-    lpips_in_paper = metric[scene_name]['lpips']
+    psnr_in_paper = metric['result'][scene_name]['psnr']
+    ssim_in_paper = metric['result'][scene_name]['ssim']
+    lpips_in_paper = metric['result'][scene_name]['lpips']
+
+    psnr_rep = metric['result1'][scene_name]['psnr']
+    ssim_rep = metric['result1'][scene_name]['ssim']
+    lpips_rep = metric['result1'][scene_name]['lpips']
 
     file_list = get_file_list(dataset_path)
     previous_train_sets = set()  # 存储之前所有的训练集
@@ -61,9 +65,11 @@ def perform_sampling(dataset_path, num_loops, sampling_ratio, output_excel, scen
     os.makedirs(tsplatter_dir, exist_ok=True)
     train_list_path = os.path.join(dataset_path, 'train_lists', f'train_list_{unique_id}.txt')
     prev_latest_dir = ''
+    train_set_size = round(len(file_list) * (sampling_ratio / 100))
+    max_steps = train_set_size * 100
+    checkpoint_name = f"step-{max_steps-1:09d}.ckpt"
     for loop in tqdm(range(num_loops)):
         # Sample training set
-        train_set_size = round(len(file_list) * (sampling_ratio / 100))
         random.shuffle(file_list)
         train_set = set(file_list[:train_set_size])
 
@@ -80,7 +86,13 @@ def perform_sampling(dataset_path, num_loops, sampling_ratio, output_excel, scen
                 f.write(f"{item}\n")
         
         # Execute training command
-        process = subprocess.Popen(f"ns-train tsplatter --data {dataset_path} --output-dir outputs/{dataset_name}/{unique_id} thermalmap --train-list-file train_list_{unique_id}.txt", shell=True, env=os.environ)
+        training_command = (f"ns-train tsplatter --data {dataset_path} --output-dir outputs/{dataset_name}/{unique_id} "
+            f"--max-num-iterations {max_steps} "
+            f"--optimizers.means.scheduler.max-steps {max_steps} "
+            f"--optimizers.camera-opt.scheduler.max-steps {max_steps} "
+            f"thermalmap --train-list-file train_list_{unique_id}.txt")
+        print(training_command)
+        process = subprocess.Popen(training_command, shell=True, env=os.environ)
         while is_empty_dir(tsplatter_dir):
             time.sleep(1)
         
@@ -92,7 +104,7 @@ def perform_sampling(dataset_path, num_loops, sampling_ratio, output_excel, scen
 
         prev_latest_dir = latest_dir
 
-        checkpoint_path = os.path.join(tsplatter_dir, latest_dir, 'nerfstudio_models', 'step-000000299.ckpt')
+        checkpoint_path = os.path.join(tsplatter_dir, latest_dir, 'nerfstudio_models', checkpoint_name)
 
         while True:
             if os.path.exists(checkpoint_path):  # 如果文件存在
@@ -104,11 +116,11 @@ def perform_sampling(dataset_path, num_loops, sampling_ratio, output_excel, scen
                 time.sleep(1)  # 每隔 1 秒钟检查一次
 
         # Execute evaluation command
-        subprocess.run(
-            f"ns-eval --load-config {os.path.join(tsplatter_dir, latest_dir, 'config.yml')} "
+        eval_command = (f"ns-eval --load-config {os.path.join(tsplatter_dir, latest_dir, 'config.yml')} "
             f"--output-path {os.path.join(tsplatter_dir, latest_dir, 'eval.json')} "
-            f"--render-output-path {os.path.join(tsplatter_dir, latest_dir, 'render')}",
-            shell=True, env=os.environ)
+            f"--render-output-path {os.path.join(tsplatter_dir, latest_dir, 'render')}")
+        print(eval_command)
+        subprocess.run(eval_command, shell=True, env=os.environ)
 
         # Load eval results
         eval_json_path = os.path.join(tsplatter_dir, latest_dir, 'eval.json')
@@ -126,14 +138,15 @@ def perform_sampling(dataset_path, num_loops, sampling_ratio, output_excel, scen
 
         # Execute smoothing command
         smoothing_command = f"python smoothing.py -s {dataset_path} --start_checkpoint {checkpoint_path} --feature_level 0 --topk 45 --encoder dino --train_list_file train_list_{unique_id}.txt"
+        print(smoothing_command)
         subprocess.run(smoothing_command, shell=True, env=os.environ)
 
         # Execute evaluation command again for smoothed results
-        subprocess.run(
-            f"ns-eval --load-config {os.path.join(tsplatter_dir, latest_dir, 'config.yml')} "
+        eval_command = (f"ns-eval --load-config {os.path.join(tsplatter_dir, latest_dir, 'config.yml')} "
             f"--output-path {os.path.join(tsplatter_dir, latest_dir, 'eval1.json')} "
-            f"--render-output-path {os.path.join(tsplatter_dir, latest_dir, 'render1')}",
-            shell=True, env=os.environ)
+            f"--render-output-path {os.path.join(tsplatter_dir, latest_dir, 'render1')}")
+        print(eval_command)
+        subprocess.run(eval_command, shell=True, env=os.environ)
 
         # Load eval1 results
         eval1_json_path = os.path.join(tsplatter_dir, latest_dir, 'eval1.json')
@@ -149,9 +162,30 @@ def perform_sampling(dataset_path, num_loops, sampling_ratio, output_excel, scen
         delta_ssim = ssim1 - ssim
         delta_lpips = lpips1 - lpips
 
+        print(f"psnr_in_paper={psnr_in_paper}")
+        print(f"ssim_in_paper={ssim_in_paper}")
+        print(f"lpips_in_paper={lpips_in_paper}")
+        
+        print(f"psnr_rep={psnr_rep}")
+        print(f"ssim_rep={ssim_rep}")
+        print(f"lpips_rep={lpips_rep}")
+
+        print(f"psnr={psnr}")
+        print(f"ssim={ssim}")
+        print(f"lpips={lpips}")
+
+        print(f"psnr1={psnr1}")
+        print(f"ssim1={ssim1}")
+        print(f"lpips1={lpips1}")
+
+        print(f"delta_psnr={delta_psnr}")
+        print(f"delta_ssim={delta_ssim}")
+        print(f"delta_lpips={delta_lpips}")
+
         # Write results to Excel file
         output_data.append([
             psnr_in_paper, ssim_in_paper, lpips_in_paper,
+            psnr_rep, ssim_rep, lpips_rep,
             psnr, ssim, lpips,
             psnr1, ssim1, lpips1,
             delta_psnr, delta_ssim, delta_lpips,
@@ -161,6 +195,7 @@ def perform_sampling(dataset_path, num_loops, sampling_ratio, output_excel, scen
     # Save the data to Excel
     df = pd.DataFrame(output_data, columns=[
         'psnr in paper', 'ssim in paper', 'lpips in paper',
+        'psnr_rep', 'ssim_rep', 'lpips_rep',
         'psnr', 'ssim', 'lpips', 'psnr1', 'ssim1', 'lpips1', 
         'delta_psnr', 'delta_ssim', 'delta_lpips', 'train_set_images'
     ])

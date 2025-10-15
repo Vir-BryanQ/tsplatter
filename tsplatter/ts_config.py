@@ -10,6 +10,8 @@ from nerfstudio.engine.schedulers import ExponentialDecaySchedulerConfig
 from nerfstudio.engine.trainer import TrainerConfig
 from nerfstudio.plugins.types import MethodSpecification
 
+MAX_STEPS = 300
+
 tsplatter = MethodSpecification(
     config=TrainerConfig(
         method_name="tsplatter",
@@ -20,7 +22,7 @@ tsplatter = MethodSpecification(
         steps_per_save=1000000,
         steps_per_eval_all_images=1000000,
         # max_num_iterations=30000,
-        max_num_iterations=300,
+        max_num_iterations=MAX_STEPS,
         mixed_precision=False,
         gradient_accumulation_steps={"camera_opt": 100, "color": 10, "shs": 10},
 
@@ -40,7 +42,7 @@ tsplatter = MethodSpecification(
                 "optimizer": AdamOptimizerConfig(lr=1.6e-4, eps=1e-15),
                 "scheduler": ExponentialDecaySchedulerConfig(
                     # lr_final=1.6e-6, max_steps=30000
-                    lr_final=1.6e-6, max_steps=300
+                    lr_final=1.6e-6, max_steps=MAX_STEPS
                 ),
             },
             "opacities": {
@@ -92,7 +94,7 @@ tsplatter = MethodSpecification(
                 "optimizer": AdamOptimizerConfig(lr=1e-3, eps=1e-15),
                 "scheduler": ExponentialDecaySchedulerConfig(
                     # lr_final=5e-5, max_steps=30000
-                    lr_final=5e-5, max_steps=300
+                    lr_final=5e-5, max_steps=MAX_STEPS
                 ),
             },
         },

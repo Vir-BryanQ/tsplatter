@@ -530,7 +530,8 @@ def move_checkpoint_file(args):
 
     # 获取 args.start_checkpoint 所在目录的父目录
     parent_dir = os.path.dirname(os.path.abspath(args.start_checkpoint))
-    origin_checkpoint_path = os.path.join(os.path.dirname(parent_dir), 'origin', 'step-000000299.ckpt')
+    checkpoint_name = os.path.basename(os.path.abspath(args.start_checkpoint))
+    origin_checkpoint_path = os.path.join(os.path.dirname(parent_dir), 'origin', checkpoint_name)
 
     # 检查 origin/step-000000299.ckpt 是否存在
     if os.path.exists(origin_checkpoint_path):
