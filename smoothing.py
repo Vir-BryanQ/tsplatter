@@ -1,42 +1,3 @@
-import os
-os.environ["MKL_NUM_THREADS"] = "12"
-os.environ["NUMEXPR_NUM_THREADS"] = "12"
-os.environ["OMP_NUM_THREADS"] = "12"
-import torch
-import time
-from torch_scatter import scatter_max
-import torch.nn.functional as F
-from PIL import Image
-from random import randint
-from utils.loss_utils import l1_loss, ssim
-from gaussian_renderer import render, network_gui, count_render
-import sys
-from scene import Scene, GaussianModel
-from utils.general_utils import safe_state
-import uuid
-from tqdm import tqdm
-from utils.image_utils import psnr
-from argparse import ArgumentParser, Namespace
-from arguments import ModelParams, PipelineParams, OptimizationParams
-try:
-    from torch.utils.tensorboard import SummaryWriter
-    TENSORBOARD_FOUND = True
-except ImportError:
-    TENSORBOARD_FOUND = False
-import numpy as np
-import faiss
-from collections import deque
-import gc
-import umap
-import matplotlib.pyplot as plt
-import shutil
-from tsplatter.utils.color_utils import rgb_to_lab, lab_to_rgb
-
-# from autoencoder.model import Autoencoder
-
-from sklearn.metrics.pairwise import cosine_similarity
-from sklearn.neighbors import NearestNeighbors
-
 def update_voting_mat(result_dict, language_feature_mask, gt_language_feature, contribution, ids, args):
     # Select only locations where Mask is True
     mask_idx = language_feature_mask.squeeze(0).nonzero(as_tuple=True)
@@ -71,6 +32,8 @@ def compute_average(features):
     return averaged_tensor
 
 def visualize_features(features):
+    import umap
+
     features_np = features.cpu().numpy()
 
     # 使用UMAP进行降维，降到2维
@@ -542,6 +505,10 @@ def move_checkpoint_file(args):
         sys.exit(-1)
 
 if __name__ == "__main__":
+    import sys
+    from argparse import ArgumentParser
+    from arguments import ModelParams, PipelineParams, OptimizationParams
+
     # Set up command line argument parser
     parser = ArgumentParser(description="Training script parameters")
     lp = ModelParams(parser)
@@ -562,6 +529,7 @@ if __name__ == "__main__":
     parser.add_argument("--topk", type=int, default = 1)
     parser.add_argument('--encoder', type=str, default="dino")
     parser.add_argument('--train_list_file', type=str, default=None)
+    parser.add_argument('--vram', type=int, required=False, default=32)
     
     # parser.add_argument("--use_pq", action="store_true")
     # parser.add_argument("--pq_index", type=str, default=None)
@@ -590,6 +558,31 @@ if __name__ == "__main__":
     #     if args.pq_index is None:
     #         raise ValueError("PQ index file is not provided.")
     #     lp._language_features_name = "language_features_pq"
+
+    import torch
+    from shuffle import calculate_required_elements
+
+    required_elements = calculate_required_elements(args.vram)
+    occupied = torch.empty(required_elements, dtype=torch.float32, device='cuda')
+    del occupied
+
+    import os
+    os.environ["MKL_NUM_THREADS"] = "12"
+    os.environ["NUMEXPR_NUM_THREADS"] = "12"
+    os.environ["OMP_NUM_THREADS"] = "12"
+    import time
+    from torch_scatter import scatter_max
+    import torch.nn.functional as F
+    from random import randint
+    from gaussian_renderer import count_render
+    from scene import Scene, GaussianModel
+    from utils.general_utils import safe_state
+    import uuid
+    from tqdm import tqdm
+    import numpy as np
+    import matplotlib.pyplot as plt
+    import shutil
+    from tsplatter.utils.color_utils import rgb_to_lab, lab_to_rgb
 
     if args.encoder not in ['dino', 'clip']:
         print('[ ERROR ] Invalid encoder name.')

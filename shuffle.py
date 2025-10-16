@@ -1,5 +1,7 @@
 import os
+import gc
 import sys
+import torch
 import random
 import json
 import shutil
@@ -31,6 +33,7 @@ def parse_arguments():
     parser.add_argument('--output_excel', type=str, required=True, help='Name of the output Excel file')
     parser.add_argument('--scene_name', type=str, required=True, help='Name of the scene')
     parser.add_argument('--metric_json', type=str, required=True, help='Path to the metric JSON file')
+    parser.add_argument('--vram', type=int, required=False, default=32)
     return parser.parse_args()
 
 
@@ -42,8 +45,16 @@ def get_file_list(dataset_path):
 def is_empty_dir(path):
     return os.path.isdir(path) and len(os.listdir(path)) == 0
 
+def calculate_required_elements(gb):
+    bytes_per_element = 4
+    gb_to_byte = 1024**3
+    required_elements = (gb * gb_to_byte) // bytes_per_element
+    return required_elements
 
-def perform_sampling(dataset_path, num_loops, sampling_ratio, output_excel, scene_name, metric_json):
+def perform_sampling(dataset_path, num_loops, sampling_ratio, output_excel, scene_name, metric_json, vram):
+    required_elements = calculate_required_elements(vram)
+    occupied = torch.empty(required_elements, dtype=torch.float32, device='cuda')
+
     with open(metric_json, 'r') as f:
         metric = json.load(f)
     psnr_in_paper = metric['result'][scene_name]['psnr']
@@ -137,9 +148,16 @@ def perform_sampling(dataset_path, num_loops, sampling_ratio, output_excel, scen
         shutil.move(checkpoint_path, origin_dir)
 
         # Execute smoothing command
-        smoothing_command = f"python smoothing.py -s {dataset_path} --start_checkpoint {checkpoint_path} --feature_level 0 --topk 45 --encoder dino --train_list_file train_list_{unique_id}.txt"
+        smoothing_command = (f"python smoothing.py -s {dataset_path} --start_checkpoint {checkpoint_path} --feature_level 0 --topk 45 "
+                             f"--encoder dino --train_list_file train_list_{unique_id}.txt --vram {vram}")
         print(smoothing_command)
+
+        del occupied
+        torch.cuda.empty_cache()
+
         subprocess.run(smoothing_command, shell=True, env=os.environ)
+
+        occupied = torch.empty(required_elements, dtype=torch.float32, device='cuda')
 
         # Execute evaluation command again for smoothed results
         eval_command = (f"ns-eval --load-config {os.path.join(tsplatter_dir, latest_dir, 'config.yml')} "
@@ -206,4 +224,4 @@ def perform_sampling(dataset_path, num_loops, sampling_ratio, output_excel, scen
 
 if __name__ == '__main__':
     args = parse_arguments()
-    perform_sampling(args.dataset_path, args.num_loops, args.sampling_ratio, args.output_excel, args.scene_name, args.metric_json)
+    perform_sampling(args.dataset_path, args.num_loops, args.sampling_ratio, args.output_excel, args.scene_name, args.metric_json, args.vram)
