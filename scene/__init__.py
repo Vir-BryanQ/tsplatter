@@ -76,9 +76,9 @@ class Scene:
             #     json.dump(json_cams, file)
 
         # 顺序无关紧要
-        if shuffle:
-            random.shuffle(scene_info.train_cameras)  # Multi-res consistent random shuffling
-            random.shuffle(scene_info.test_cameras)  # Multi-res consistent random shuffling
+        # if shuffle:
+            # random.shuffle(scene_info.train_cameras)  # Multi-res consistent random shuffling
+            # random.shuffle(scene_info.test_cameras)  # Multi-res consistent random shuffling
 
         # nerf_normalization仅在这里被使用
         self.cameras_extent = scene_info.nerf_normalization["radius"]

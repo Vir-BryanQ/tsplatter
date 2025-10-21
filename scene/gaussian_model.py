@@ -134,6 +134,7 @@ class GaussianModel:
         #     self.denom = denom
 
         self.active_sh_degree =  int((model_args['features_rest'].shape[1] + 1) **  0.5 - 1)
+        self.thermal_sh_degree =  int((model_args['thermal_features_rest'].shape[1] + 1) **  0.5 - 1)
         self._xyz = model_args['means'].cuda()
         self._features_dc = model_args['features_dc'].cuda()
         self._features_rest = model_args['features_rest'].cuda()

@@ -46,6 +46,8 @@ class CameraInfo(NamedTuple):
     image_name: str
     width: int
     height: int
+    fx: float
+    fy: float
 
 class SceneInfo(NamedTuple):
     point_cloud: BasicPointCloud
@@ -99,6 +101,7 @@ def readColmapCameras(cam_extrinsics, cam_intrinsics, images_folder):
 
         if intr.model=="SIMPLE_PINHOLE":
             focal_length_x = intr.params[0]
+            focal_length_y = focal_length_x
             FovY = focal2fov(focal_length_x, height)
             FovX = focal2fov(focal_length_x, width)
         elif intr.model=="PINHOLE":
@@ -139,7 +142,7 @@ def readColmapCameras(cam_extrinsics, cam_intrinsics, images_folder):
 
         cam_info = CameraInfo(uid=uid, R=R, T=T, FovY=FovY, FovX=FovX, cx=width/2, cy=height/2, image=image, 
                               depth=None, sam_mask=sam_mask, mask_feat=mask_feat,
-                              image_path=image_path, image_name=image_name, width=width, height=height)
+                              image_path=image_path, image_name=image_name, width=width, height=height, fx=focal_length_x, fy=focal_length_y)
         cam_infos.append(cam_info)
     sys.stdout.write('\n')
     return cam_infos
@@ -280,8 +283,12 @@ def readColmapSceneInfo(path, images, eval, llffhold=8,
         with (Path(path) / "train_lists" / f"{train_list_file}").open("r", encoding="utf8") as f:
             filenames = [line.strip() for line in f.read().splitlines() if line.strip()]
     else:
-        with (Path(path) / "train_list.txt").open("r", encoding="utf8") as f:
-            filenames = [line.strip() for line in f.read().splitlines() if line.strip()]
+        try:
+            with (Path(path) / "train_list.txt").open("r", encoding="utf8") as f:
+                filenames = [line.strip() for line in f.read().splitlines() if line.strip()]
+        except FileNotFoundError as e:
+            print(f'Trivial FileNotFoundError: {e}')
+            filenames = []
     image_filenames = [image.name for image in cam_extrinsics.values()]
 
     # 检测 split_filenames 中的文件名是否在 image_filenames 中存在

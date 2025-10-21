@@ -12,6 +12,7 @@
 import numpy as np
 import collections
 import struct
+import sys
 
 CameraModel = collections.namedtuple(
     "CameraModel", ["model_id", "model_name", "num_params"])
