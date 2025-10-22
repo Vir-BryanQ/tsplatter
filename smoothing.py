@@ -237,26 +237,26 @@ def compute_significant_mask(contribution, ids, N, max_threshold=0.1, use_max_we
     t0 = time.perf_counter()
 
     device = contribution.device
+    per_gauss_contrib = torch.zeros(N, device=device, dtype=contribution.dtype)  # [N]
+    M = contribution.shape[0]
+    block_size = 60
+    for start in range(0, M, block_size):
+        end = min(start + block_size, M)
+        contribution_blk = contribution[start:end].reshape(-1)   # [B*H*W*L]
+        ids_blk = ids[start:end].reshape(-1)   # [B*H*W*L]
+        valid_mask = (ids_blk != -1)    # [B*H*W*L]
+        contribution_blk = contribution_blk[valid_mask]
+        ids_blk = ids_blk[valid_mask]
+        if use_max_weight:
+            out = scatter_max(contribution_blk, ids_blk.type(torch.long))[0]
+            per_gauss_contrib[:out.shape[0]] = torch.max(per_gauss_contrib[:out.shape[0]], out)
+        else:
+            per_gauss_contrib.index_put_((ids_blk,), contribution_blk, accumulate=True)
     if use_max_weight:
-        per_gauss_contrib = torch.zeros(N, device=device, dtype=contribution.dtype)  # [N]
-        contribution = contribution.reshape(-1)   # [M*H*W*L]
-        ids = ids.reshape(-1)    # [M*H*W*L]
-        valid_mask = (ids != -1)    # [M*H*W*L]
-        contribution = contribution[valid_mask]
-        ids = ids[valid_mask]
-        out = scatter_max(contribution, ids.type(torch.long))[0]
-        per_gauss_contrib[:out.shape[0]] = out
         significant_mask = per_gauss_contrib > max_threshold  # [N]
     else:
-        per_gauss_contrib = torch.zeros(N, device=device, dtype=contribution.dtype)  # [N]
-        contribution = contribution.reshape(-1)   # [M*H*W*L]
-        ids = ids.reshape(-1)    # [M*H*W*L]
-        valid_mask = (ids != -1)    # [M*H*W*L]
-        contribution = contribution[valid_mask]
-        ids = ids[valid_mask]
-        per_gauss_contrib.index_put_((ids,), contribution, accumulate=True)
         significant_mask = per_gauss_contrib > sum_threshold  # [N]
-    
+
     t1 = time.perf_counter()
     print(f"compute_significant_mask: {(t1 - t0) * 1000:.3f} ms")
 
