@@ -376,6 +376,7 @@ def temperature_propagation(gaussians, scene, pipe, background, dataset, args):
     t0 = time.perf_counter()
 
     viewpoint_stack = scene.getTestCameras().copy()
+    print(f'Use {len(viewpoint_stack)} images for significant mask computation')
     cluster_ids = cosine_similarity_clustering(gaussians.get_language_feature)
     significant_mask = compute_significant_mask(viewpoint_stack, gaussians, pipe, background)
     # thermal_features = laplacian_smoothing(gaussians, cluster_ids, significant_mask)
