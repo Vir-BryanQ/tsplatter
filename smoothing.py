@@ -233,17 +233,31 @@ def cosine_similarity_clustering(features, threshold=0.83, block_size=2000):
 
     return cluster_ids
         
-def compute_significant_mask(contribution, ids, N, max_threshold=0.1, use_max_weight=True, sum_threshold=3):
+def compute_significant_mask(viewpoint_stack, gaussians, pipe, background, max_threshold=0.1, use_max_weight=True, sum_threshold=3):
     t0 = time.perf_counter()
 
-    device = contribution.device
-    per_gauss_contrib = torch.zeros(N, device=device, dtype=contribution.dtype)  # [N]
-    M = contribution.shape[0]
-    block_size = 60
+    device = gaussians.get_opacity.device
+    N = len(gaussians.get_opacity)
+    per_gauss_contrib = torch.zeros(N, device=device, dtype=torch.float32)  # [N]
+
+    M = len(viewpoint_stack)
+    block_size = 30
     for start in range(0, M, block_size):
         end = min(start + block_size, M)
-        contribution_blk = contribution[start:end].reshape(-1)   # [B*H*W*L]
-        ids_blk = ids[start:end].reshape(-1)   # [B*H*W*L]
+        ids_list = []
+        contribution_list = []
+        for i in range(end - start):
+            viewpoint_cam = viewpoint_stack[start + i]
+            render_pkg = count_render(viewpoint_cam, gaussians, pipe, background)
+            ids, contribution = (
+                # [H,W,100]
+                render_pkg['per_pixel_gaussian_ids'].detach(),
+                render_pkg['per_pixel_gaussian_contributions'].detach(), 
+            )
+            ids_list.append(ids)
+            contribution_list.append(contribution)
+        ids_blk = torch.stack(ids_list, dim=0).reshape(-1)    # [B*H*W*L]
+        contribution_blk = torch.stack(contribution_list, dim=0).reshape(-1) # [B*H*W*L]
         valid_mask = (ids_blk != -1)    # [B*H*W*L]
         contribution_blk = contribution_blk[valid_mask]
         ids_blk = ids_blk[valid_mask]
@@ -361,25 +375,9 @@ def laplacian_smoothing(gaussians, cluster_ids, full_significant_mask, lambda_re
 def temperature_propagation(gaussians, scene, pipe, background, dataset, args):
     t0 = time.perf_counter()
 
-    num_gaussians = len(gaussians.get_opacity)
     viewpoint_stack = scene.getTestCameras().copy()
-    ids_list = []
-    contribution_list = []
-    for i in range(len(viewpoint_stack)):
-        viewpoint_cam = viewpoint_stack[i]
-        render_pkg = count_render(viewpoint_cam, gaussians, pipe, background)
-        ids, contribution = (
-            # [H,W,100]
-            render_pkg['per_pixel_gaussian_ids'].detach(),
-            render_pkg['per_pixel_gaussian_contributions'].detach(), 
-        )
-        ids_list.append(ids)
-        contribution_list.append(contribution)
-    ids_stack = torch.stack(ids_list, dim=0)    # [M,H,W,100]
-    contribution_stack = torch.stack(contribution_list, dim=0) # [M,H,W,100]
-
     cluster_ids = cosine_similarity_clustering(gaussians.get_language_feature)
-    significant_mask = compute_significant_mask(contribution_stack, ids_stack, num_gaussians)
+    significant_mask = compute_significant_mask(viewpoint_stack, gaussians, pipe, background)
     # thermal_features = laplacian_smoothing(gaussians, cluster_ids, significant_mask)
     thermal_colors, retain_mask = laplacian_smoothing(gaussians, cluster_ids, significant_mask)
 
