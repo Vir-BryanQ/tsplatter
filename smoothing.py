@@ -276,7 +276,7 @@ def compute_significant_mask(viewpoint_stack, gaussians, pipe, background, max_t
 
     return significant_mask
 
-def laplacian_smoothing(gaussians, cluster_ids, full_significant_mask, lambda_reg=1e-3, k_neighbors=100_000_000):
+def laplacian_smoothing(gaussians, cluster_ids, full_significant_mask, lambda_reg=1e-3, k_neighbors=10000):
     t0 = time.perf_counter()
 
     N = gaussians.get_thermal_features.shape[0]
@@ -290,6 +290,7 @@ def laplacian_smoothing(gaussians, cluster_ids, full_significant_mask, lambda_re
     for cluster_id in unique_cluster_ids:
         # 如果在循环里频繁 gc.collect()，几乎等于每一步都在做“冷启动”，完全失去了 PyTorch 缓存的优势    1ms -> 600ms
         indices = torch.where(cluster_ids == cluster_id)[0] # [M]
+        # print(f'{indices.shape[0]}')
 
         # colors[indices] = generate_lab_colors(indices.shape[0], indices.device)
         # continue
@@ -330,6 +331,7 @@ def laplacian_smoothing(gaussians, cluster_ids, full_significant_mask, lambda_re
         rhs = -torch.mm(L_ij, known_colors)  # [M2,3]
         lhs = L_ii + lambda_reg * torch.eye(L_ii.shape[0], device=device)   # [M2,M2]
 
+        del euclidean_dists, knn_idx, weights, graph_mask, adj_matrix, L_ii, L_ij
         try:
             smooth_unknown_colors = torch.linalg.solve(lhs, rhs)    # [M2,3]
         except torch.linalg.LinAlgError:
