@@ -14,6 +14,7 @@ from datetime import datetime
 import psutil
 import uuid
 from tqdm import tqdm
+from utils.general_utils import safe_state
 
 def send_signal_to_process_and_children(pid):
     # 获取父进程对象
@@ -86,6 +87,7 @@ def perform_sampling(dataset_path, num_loops, sampling_ratio, output_excel, scen
 
         # Ensure the current train_set is not the same as any previous train set
         while any(train_set == prev_train_set for prev_train_set in previous_train_sets):
+            print('Duplicate train set.')
             random.shuffle(file_list)
             train_set = set(file_list[:train_set_size])
 
@@ -224,4 +226,5 @@ def perform_sampling(dataset_path, num_loops, sampling_ratio, output_excel, scen
 
 if __name__ == '__main__':
     args = parse_arguments()
+    safe_state(False)
     perform_sampling(args.dataset_path, args.num_loops, args.sampling_ratio, args.output_excel, args.scene_name, args.metric_json, args.vram)
