@@ -228,4 +228,5 @@ def perform_sampling(dataset_path, num_loops, sampling_ratio, output_excel, scen
 if __name__ == '__main__':
     args = parse_arguments()
     safe_state(False)
+    VRAM = args.vram
     perform_sampling(args.dataset_path, args.num_loops, args.sampling_ratio, args.output_excel, args.scene_name, args.metric_json, args.vram, args.vram1)

@@ -1,4 +1,8 @@
-print("xxxxxxxxxxxxxxxxxxxxxxxxxxxxx")
+import torch
+from shuffle import VRAM
+
+print(VRAM)
+
 
 from .data.thermalmap_dataparser import ThermalMapDataParserSpecification
 
