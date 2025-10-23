@@ -11,8 +11,8 @@ def preallocate_vmem(vram=38):
         except RuntimeError as e:
             t = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
             if 'CUDA out of memory' in str(e):
-                # total_memory, free_memory = torch.cuda.mem_get_info(torch.cuda.current_device())
-                print(f"*** {e} [{t}]")
+                total_memory, free_memory = torch.cuda.mem_get_info(torch.cuda.current_device())
+                print(f"*** CUDA OOM: {free_memory / (1024 * 1024)}MiB is free [{t}]")
             else:
                 print(f"### {e} [{t}]")
 

@@ -108,7 +108,7 @@ def perform_sampling(dataset_path, num_loops, sampling_ratio, output_excel, scen
             f"thermalmap --train-list-file train_list_{unique_id}.txt")
         print(training_command)
         process = subprocess.Popen(training_command, shell=True, env=os.environ)
-        time.sleep(2)
+        time.sleep(3)
         release_vmem()
         while is_empty_dir(tsplatter_dir):
             time.sleep(1)
@@ -166,7 +166,7 @@ def perform_sampling(dataset_path, num_loops, sampling_ratio, output_excel, scen
         print(smoothing_command)
         process = subprocess.Popen(smoothing_command, shell=True, env=os.environ)
 
-        time.sleep(2)
+        time.sleep(1)
         release_vmem()
         process.wait()
 
