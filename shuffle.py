@@ -18,12 +18,9 @@ from utils.general_utils import safe_state
 from tsplatter import preallocate_vmem, release_vmem
 
 def send_signal_to_process_and_children(pid):
-    # 获取父进程对象
     parent = psutil.Process(pid)
-    # 向所有子进程发送 SIGINT
     for child in parent.children(recursive=True):  # 获取递归的所有子进程
         child.send_signal(signal.SIGINT)
-    # 向父进程发送 SIGINT
     parent.send_signal(signal.SIGINT)
 
 
@@ -47,12 +44,6 @@ def get_file_list(dataset_path):
 
 def is_empty_dir(path):
     return os.path.isdir(path) and len(os.listdir(path)) == 0
-
-def calculate_required_elements(gb):
-    bytes_per_element = 4
-    gb_to_byte = 1024**3
-    required_elements = (gb * gb_to_byte) // bytes_per_element
-    return required_elements
 
 def perform_sampling(dataset_path, num_loops, sampling_ratio, output_excel, scene_name, metric_json, vram, vram1):
     # device = torch.cuda.current_device()
@@ -124,13 +115,13 @@ def perform_sampling(dataset_path, num_loops, sampling_ratio, output_excel, scen
         checkpoint_path = os.path.join(tsplatter_dir, latest_dir, 'nerfstudio_models', checkpoint_name)
 
         while True:
-            if os.path.exists(checkpoint_path):  # 如果文件存在
+            if os.path.exists(checkpoint_path): 
                 time.sleep(5)
                 send_signal_to_process_and_children(process.pid)
                 process.wait()
-                break  # 退出循环
+                break  
             else:
-                time.sleep(1)  # 每隔 1 秒钟检查一次
+                time.sleep(1)  
 
         preallocate_vmem()
         # Execute evaluation command
