@@ -35,6 +35,7 @@ def parse_arguments():
     parser.add_argument('--scene_name', type=str, required=True, help='Name of the scene')
     parser.add_argument('--metric_json', type=str, required=True, help='Path to the metric JSON file')
     parser.add_argument('--vram', type=int, required=False, default=32)
+    parser.add_argument('--vram1', type=int, required=False, default=32)
     return parser.parse_args()
 
 
@@ -52,7 +53,7 @@ def calculate_required_elements(gb):
     required_elements = (gb * gb_to_byte) // bytes_per_element
     return required_elements
 
-def perform_sampling(dataset_path, num_loops, sampling_ratio, output_excel, scene_name, metric_json, vram):
+def perform_sampling(dataset_path, num_loops, sampling_ratio, output_excel, scene_name, metric_json, vram, vram1):
     required_elements = calculate_required_elements(vram)
     occupied = torch.empty(required_elements, dtype=torch.float32, device='cuda')
 
@@ -151,7 +152,7 @@ def perform_sampling(dataset_path, num_loops, sampling_ratio, output_excel, scen
 
         # Execute smoothing command
         smoothing_command = (f"python smoothing.py -s {dataset_path} --start_checkpoint {checkpoint_path} --feature_level 0 --topk 45 "
-                             f"--encoder dino --train_list_file train_list_{unique_id}.txt --vram {vram}")
+                             f"--encoder dino --train_list_file train_list_{unique_id}.txt --vram {vram1}")
         print(smoothing_command)
 
         del occupied
@@ -227,4 +228,4 @@ def perform_sampling(dataset_path, num_loops, sampling_ratio, output_excel, scen
 if __name__ == '__main__':
     args = parse_arguments()
     safe_state(False)
-    perform_sampling(args.dataset_path, args.num_loops, args.sampling_ratio, args.output_excel, args.scene_name, args.metric_json, args.vram)
+    perform_sampling(args.dataset_path, args.num_loops, args.sampling_ratio, args.output_excel, args.scene_name, args.metric_json, args.vram, args.vram1)

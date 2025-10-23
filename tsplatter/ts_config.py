@@ -1,3 +1,5 @@
+print("xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx")
+
 from __future__ import annotations
 
 from tsplatter.data.thermalmap_dataparser import ThermalMapDataParserConfig
