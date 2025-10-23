@@ -1,3 +1,5 @@
+print("xxxxxxxxxxxxxxxxxxxxxxxxxxxxx")
+
 from .data.thermalmap_dataparser import ThermalMapDataParserSpecification
 
 __all__ = [
