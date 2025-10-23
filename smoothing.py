@@ -312,26 +312,30 @@ def laplacian_smoothing(gaussians, cluster_ids, full_significant_mask, lambda_re
         euclidean_dists = torch.cdist(means, means)   # [M,M]
         knn_idx = euclidean_dists.topk(k + 1, largest=False).indices   # [M,k+1]
         # weights = 1 / (euclidean_dists + 1e-9)  # [M,M]  
-        weights = 1 / (torch.pow(euclidean_dists, 2) + 1e-9)  # [M,M]  
+        weights = euclidean_dists.pow_(2).add_(1e-9).reciprocal_() # [M,M] 
 
         graph_mask = torch.zeros((M, M), device=device, dtype=torch.bool)     # [M,M]
         graph_mask.scatter_(1, knn_idx, True)
-        graph_mask = graph_mask | graph_mask.T  # [M,M]
+        graph_mask = graph_mask | graph_mask.T
+        del knn_idx
 
-        graph_mask.fill_diagonal_(0)
-        adj_matrix = torch.zeros((M, M), device=device, dtype=torch.float32)     # [M,M]
-        adj_matrix[graph_mask] = weights[graph_mask]
+        graph_mask.fill_diagonal_(0).logical_not_()
+        weights[graph_mask] = 0.
+        adj_matrix = weights
+        del graph_mask
 
-        degree_matrix = torch.diag(adj_matrix.sum(dim=1))
-        laplacian_matrix = degree_matrix - adj_matrix
+        degree_matrix = torch.diag(adj_matrix.sum(dim=1))   # [M,M]
+        laplacian_matrix = degree_matrix - adj_matrix   # [M,M]
+        del degree_matrix, adj_matrix
 
         L_ii = laplacian_matrix[non_significant_mask, :][:, non_significant_mask]  # [M2,M2]
         L_ij = laplacian_matrix[non_significant_mask, :][:, significant_mask]  # [M2,M1]
+        del laplacian_matrix
 
         rhs = -torch.mm(L_ij, known_colors)  # [M2,3]
         lhs = L_ii + lambda_reg * torch.eye(L_ii.shape[0], device=device)   # [M2,M2]
+        del L_ii, L_ij
 
-        del euclidean_dists, knn_idx, weights, graph_mask, adj_matrix, L_ii, L_ij
         try:
             smooth_unknown_colors = torch.linalg.solve(lhs, rhs)    # [M2,3]
         except torch.linalg.LinAlgError:
