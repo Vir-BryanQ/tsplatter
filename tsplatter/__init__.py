@@ -7,7 +7,7 @@ def calculate_required_elements(gb):
     return required_elements
 
 device = torch.cuda.current_device()
-total_memory, free_memory = torch.cuda.mem_get_info(device_id)
+total_memory, free_memory = torch.cuda.mem_get_info(device)
 TARGET_PERCENTAGE = 0.90
 target_allocation_bytes = int(free_memory * TARGET_PERCENTAGE)
 required_elements = calculate_required_elements(target_allocation_bytes)
