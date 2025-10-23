@@ -332,6 +332,8 @@ def laplacian_smoothing(gaussians, cluster_ids, full_significant_mask, lambda_re
         L_ij = laplacian_matrix[non_significant_mask, :][:, significant_mask]  # [M2,M1]
         del laplacian_matrix
 
+        print(L_ii, L_ij)
+
         rhs = -torch.mm(L_ij, known_colors)  # [M2,3]
         lhs = L_ii + lambda_reg * torch.eye(L_ii.shape[0], device=device)   # [M2,M2]
         del L_ii, L_ij
