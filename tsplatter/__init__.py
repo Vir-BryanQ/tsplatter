@@ -12,7 +12,9 @@ TARGET_PERCENTAGE = 0.90
 print(free_memory)
 target_allocation_bytes = int(free_memory * TARGET_PERCENTAGE)
 required_elements = calculate_required_elements(target_allocation_bytes)
-occupied = torch.empty(required_elements, dtype=torch.float32, device='cuda')
+dim1 = 4096
+dim2 = required_elements // dim1
+occupied = torch.empty([dim1, dim2], dtype=torch.float32, device='cuda')
 del occupied
 
 from .data.thermalmap_dataparser import ThermalMapDataParserSpecification
