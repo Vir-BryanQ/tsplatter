@@ -73,6 +73,7 @@ def perform_sampling(dataset_path, num_loops, sampling_ratio, output_excel, scen
     train_set_size = round(len(file_list) * (sampling_ratio / 100))
     max_steps = train_set_size * 100
     checkpoint_name = f"step-{max_steps-1:09d}.ckpt"
+    wait_list = [7, 7, 3, 7]
     for loop in tqdm(range(num_loops)):
         # Sample training set
         random.shuffle(file_list)
@@ -99,7 +100,7 @@ def perform_sampling(dataset_path, num_loops, sampling_ratio, output_excel, scen
             f"thermalmap --train-list-file train_list_{unique_id}.txt")
         print(training_command)
         process = subprocess.Popen(training_command, shell=True, env=os.environ)
-        time.sleep(3)
+        time.sleep(wait_list[0])
         release_vmem()
         while is_empty_dir(tsplatter_dir):
             time.sleep(1)
@@ -131,7 +132,7 @@ def perform_sampling(dataset_path, num_loops, sampling_ratio, output_excel, scen
         print(eval_command)
         process = subprocess.Popen(eval_command, shell=True, env=os.environ)
 
-        time.sleep(2)
+        time.sleep(wait_list[1])
         release_vmem()
         process.wait()
 
@@ -157,7 +158,7 @@ def perform_sampling(dataset_path, num_loops, sampling_ratio, output_excel, scen
         print(smoothing_command)
         process = subprocess.Popen(smoothing_command, shell=True, env=os.environ)
 
-        time.sleep(1)
+        time.sleep(wait_list[2])
         release_vmem()
         process.wait()
 
@@ -170,7 +171,7 @@ def perform_sampling(dataset_path, num_loops, sampling_ratio, output_excel, scen
         print(eval_command)
         process = subprocess.Popen(eval_command, shell=True, env=os.environ)
 
-        time.sleep(2)
+        time.sleep(wait_list[3])
         release_vmem()
         process.wait()
 
