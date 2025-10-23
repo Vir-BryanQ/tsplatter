@@ -55,7 +55,7 @@ def calculate_required_elements(gb):
 
 def perform_sampling(dataset_path, num_loops, sampling_ratio, output_excel, scene_name, metric_json, vram, vram1):
     required_elements = calculate_required_elements(vram)
-    occupied = torch.empty(required_elements, dtype=torch.float32, device='cuda')
+    # occupied = torch.empty(required_elements, dtype=torch.float32, device='cuda')
 
     with open(metric_json, 'r') as f:
         metric = json.load(f)
@@ -99,6 +99,9 @@ def perform_sampling(dataset_path, num_loops, sampling_ratio, output_excel, scen
             for item in train_set:
                 f.write(f"{item}\n")
         
+        # del occupied
+        # torch.cuda.empty_cache()
+
         # Execute training command
         training_command = (f"ns-train tsplatter --data {dataset_path} --output-dir outputs/{dataset_name}/{unique_id} "
             f"--max-num-iterations {max_steps} "
@@ -155,12 +158,7 @@ def perform_sampling(dataset_path, num_loops, sampling_ratio, output_excel, scen
                              f"--encoder dino --train_list_file train_list_{unique_id}.txt --vram {vram1}")
         print(smoothing_command)
 
-        del occupied
-        torch.cuda.empty_cache()
-
         subprocess.run(smoothing_command, shell=True, env=os.environ)
-
-        occupied = torch.empty(required_elements, dtype=torch.float32, device='cuda')
 
         # Execute evaluation command again for smoothed results
         eval_command = (f"ns-eval --load-config {os.path.join(tsplatter_dir, latest_dir, 'config.yml')} "
@@ -168,6 +166,8 @@ def perform_sampling(dataset_path, num_loops, sampling_ratio, output_excel, scen
             f"--render-output-path {os.path.join(tsplatter_dir, latest_dir, 'render1')}")
         print(eval_command)
         subprocess.run(eval_command, shell=True, env=os.environ)
+
+        # occupied = torch.empty(required_elements, dtype=torch.float32, device='cuda')
 
         # Load eval1 results
         eval1_json_path = os.path.join(tsplatter_dir, latest_dir, 'eval1.json')
@@ -228,5 +228,4 @@ def perform_sampling(dataset_path, num_loops, sampling_ratio, output_excel, scen
 if __name__ == '__main__':
     args = parse_arguments()
     safe_state(False)
-    VRAM = args.vram
     perform_sampling(args.dataset_path, args.num_loops, args.sampling_ratio, args.output_excel, args.scene_name, args.metric_json, args.vram, args.vram1)
