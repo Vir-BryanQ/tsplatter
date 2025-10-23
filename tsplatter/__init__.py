@@ -1,11 +1,25 @@
 import torch
+from datetime import datetime
 
-TARGET_PERCENTAGE = 0.90
-device = torch.cuda.current_device()
-total_memory, free_memory = torch.cuda.mem_get_info(device)
-required_elements = int(free_memory * TARGET_PERCENTAGE / 4)
-occupied = torch.empty(required_elements , dtype=torch.float32, device='cuda')
-del occupied
+def preallocate_vmem(vram=38):
+    required_elements = int(vram * 1024 * 1024 * 1024 / 4)
+    while True:
+        try:
+            occupied = torch.empty(required_elements , dtype=torch.float32, device='cuda')
+            del occupied
+            break
+        except RuntimeError as e:
+            t = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+            if 'CUDA out of memory' in str(e):
+                # total_memory, free_memory = torch.cuda.mem_get_info(torch.cuda.current_device())
+                print(f"*** {e} [{t}]")
+            else:
+                print(f"### {e} [{t}]")
+
+def release_vmem():
+    torch.cuda.empty_cache()
+
+preallocate_vmem()
 
 from .data.thermalmap_dataparser import ThermalMapDataParserSpecification
 

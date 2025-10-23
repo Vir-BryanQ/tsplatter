@@ -15,6 +15,7 @@ import psutil
 import uuid
 from tqdm import tqdm
 from utils.general_utils import safe_state
+from tsplatter import preallocate_vmem, release_vmem
 
 def send_signal_to_process_and_children(pid):
     # 获取父进程对象
@@ -54,8 +55,8 @@ def calculate_required_elements(gb):
     return required_elements
 
 def perform_sampling(dataset_path, num_loops, sampling_ratio, output_excel, scene_name, metric_json, vram, vram1):
-    required_elements = calculate_required_elements(vram)
-    # occupied = torch.empty(required_elements, dtype=torch.float32, device='cuda')
+    # device = torch.cuda.current_device()
+    preallocate_vmem()
 
     with open(metric_json, 'r') as f:
         metric = json.load(f)
@@ -99,9 +100,6 @@ def perform_sampling(dataset_path, num_loops, sampling_ratio, output_excel, scen
             for item in train_set:
                 f.write(f"{item}\n")
         
-        # del occupied
-        # torch.cuda.empty_cache()
-
         # Execute training command
         training_command = (f"ns-train tsplatter --data {dataset_path} --output-dir outputs/{dataset_name}/{unique_id} "
             f"--max-num-iterations {max_steps} "
@@ -110,6 +108,8 @@ def perform_sampling(dataset_path, num_loops, sampling_ratio, output_excel, scen
             f"thermalmap --train-list-file train_list_{unique_id}.txt")
         print(training_command)
         process = subprocess.Popen(training_command, shell=True, env=os.environ)
+        time.sleep(2)
+        release_vmem()
         while is_empty_dir(tsplatter_dir):
             time.sleep(1)
         
@@ -132,12 +132,19 @@ def perform_sampling(dataset_path, num_loops, sampling_ratio, output_excel, scen
             else:
                 time.sleep(1)  # 每隔 1 秒钟检查一次
 
+        preallocate_vmem()
         # Execute evaluation command
         eval_command = (f"ns-eval --load-config {os.path.join(tsplatter_dir, latest_dir, 'config.yml')} "
             f"--output-path {os.path.join(tsplatter_dir, latest_dir, 'eval.json')} "
             f"--render-output-path {os.path.join(tsplatter_dir, latest_dir, 'render')}")
         print(eval_command)
-        subprocess.run(eval_command, shell=True, env=os.environ)
+        process = subprocess.Popen(eval_command, shell=True, env=os.environ)
+
+        time.sleep(2)
+        release_vmem()
+        process.wait()
+
+        preallocate_vmem()
 
         # Load eval results
         eval_json_path = os.path.join(tsplatter_dir, latest_dir, 'eval.json')
@@ -157,17 +164,26 @@ def perform_sampling(dataset_path, num_loops, sampling_ratio, output_excel, scen
         smoothing_command = (f"python smoothing.py -s {dataset_path} --start_checkpoint {checkpoint_path} --feature_level 0 --topk 45 "
                              f"--encoder dino --train_list_file train_list_{unique_id}.txt --vram {vram1}")
         print(smoothing_command)
+        process = subprocess.Popen(smoothing_command, shell=True, env=os.environ)
 
-        subprocess.run(smoothing_command, shell=True, env=os.environ)
+        time.sleep(2)
+        release_vmem()
+        process.wait()
+
+        preallocate_vmem()
 
         # Execute evaluation command again for smoothed results
         eval_command = (f"ns-eval --load-config {os.path.join(tsplatter_dir, latest_dir, 'config.yml')} "
             f"--output-path {os.path.join(tsplatter_dir, latest_dir, 'eval1.json')} "
             f"--render-output-path {os.path.join(tsplatter_dir, latest_dir, 'render1')}")
         print(eval_command)
-        subprocess.run(eval_command, shell=True, env=os.environ)
+        process = subprocess.Popen(eval_command, shell=True, env=os.environ)
 
-        # occupied = torch.empty(required_elements, dtype=torch.float32, device='cuda')
+        time.sleep(2)
+        release_vmem()
+        process.wait()
+
+        preallocate_vmem()
 
         # Load eval1 results
         eval1_json_path = os.path.join(tsplatter_dir, latest_dir, 'eval1.json')

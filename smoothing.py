@@ -510,6 +510,10 @@ def move_checkpoint_file(args):
         sys.exit(-1)
 
 if __name__ == "__main__":
+    import torch
+    from tsplatter import preallocate_vmem
+    preallocate_vmem()
+
     import sys
     from argparse import ArgumentParser
     from arguments import ModelParams, PipelineParams, OptimizationParams
@@ -563,13 +567,6 @@ if __name__ == "__main__":
     #     if args.pq_index is None:
     #         raise ValueError("PQ index file is not provided.")
     #     lp._language_features_name = "language_features_pq"
-
-    import torch
-    from shuffle import calculate_required_elements
-
-    required_elements = calculate_required_elements(args.vram)
-    occupied = torch.empty(required_elements, dtype=torch.float32, device='cuda')
-    del occupied
 
     import os
     os.environ["MKL_NUM_THREADS"] = "12"
