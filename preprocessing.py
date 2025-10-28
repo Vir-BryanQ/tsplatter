@@ -144,8 +144,8 @@ def create(image_list, data_list, save_folder, dataset_path):
     seg_maps = []
     total_lengths = []
     timer = 0
-    img_embeds = torch.zeros((len(image_list), 300, embed_size))    # [N,300,D]
-    seg_maps = torch.zeros((len(image_list), 4, *image_list[0].shape[1:]))  # [N,4,H,W]
+    img_embeds = torch.zeros((len(image_list), 300, embed_size)).cuda()    # [N,300,D]
+    seg_maps = torch.zeros((len(image_list), 4, *image_list[0].shape[1:])).cuda()  # [N,4,H,W]
     mask_generator.predictor.model.to('cuda')
 
     for i, img in tqdm(enumerate(image_list), desc="Embedding images", leave=False):
@@ -179,7 +179,7 @@ def create(image_list, data_list, save_folder, dataset_path):
             pad = total_length - img_embeds.shape[1]
             img_embeds = torch.cat([
                 img_embeds,
-                torch.zeros((len(image_list), pad, embed_size))
+                torch.zeros((len(image_list), pad, embed_size)).cuda()
             ], dim=1)
 
         # 获取所有embeddings
@@ -196,13 +196,13 @@ def create(image_list, data_list, save_folder, dataset_path):
         for j, (k, v) in enumerate(seg_map.items()):
             # k没有用到
             if j == 0:
-                seg_map_tensor.append(torch.from_numpy(v))
+                seg_map_tensor.append(v)
                 continue
             assert v.max() == lengths[j] - 1, f"{j}, {v.max()}, {lengths[j]-1}"
             # 由于所有level的embeddings都已经被顺序存入img_embeds中，为了保证seg_map中的索引能够正确访问到对应的embedding,
             # 需要给原索引加上一个偏移量获取正确的索引
             v[v != -1] += lengths_cumsum[j-1]
-            seg_map_tensor.append(torch.from_numpy(v))
+            seg_map_tensor.append(v)
         seg_map = torch.stack(seg_map_tensor, dim=0)    # 形状取决于使用了几个level的分割结果，最多是 [4,H,W]
         # seg_maps[i] = seg_map.repeat(4,1,1) # [1, H, W] -> [4, H, W] 
         seg_maps[i] = seg_map
@@ -223,8 +223,8 @@ def create(image_list, data_list, save_folder, dataset_path):
 def sava_numpy(save_path, data):
     save_path_s = save_path + '_s.npy'
     save_path_f = save_path + '_f.npy'
-    np.save(save_path_s, data['seg_maps'].numpy())
-    np.save(save_path_f, data['feature'].numpy())
+    np.save(save_path_s, data['seg_maps'].cpu().numpy())
+    np.save(save_path_f, data['feature'].cpu().numpy())
 
 def _embed_clip_dino_sam_tiles(image, sam_encoder):
     # image [1,3,H,W]
@@ -243,7 +243,7 @@ def _embed_clip_dino_sam_tiles(image, sam_encoder):
             # CLIP或者DINO
             feat_embed = model.encode_image(tiles)  # [b, D]
         feat_embed /= feat_embed.norm(dim=-1, keepdim=True)     # 将embedding归一化
-        feat_embeds[mode] = feat_embed.detach().cpu().half()    # .half()将数据类型转换为 float16（半精度）
+        feat_embeds[mode] = feat_embed.detach().half()    # .half()将数据类型转换为 float16（半精度）
     
     # seg_map_l = {}
     # seg_map_l['l'] = seg_map['l']
@@ -364,18 +364,18 @@ def sam_encoder(image):
     # pre-compute postprocess
     masks_default, masks_s, masks_m, masks_l = \
         masks_update(masks_default, masks_s, masks_m, masks_l, iou_thr=0.8, score_thr=0.7, inner_thr=0.5)
-    
+
     def mask2segmap(masks, image):
         seg_img_list = []
         # seg_map [H,W]
-        seg_map = -np.ones(image.shape[:2], dtype=np.int32) # 创建一个与图像尺寸相同的二维数组 seg_map，并初始化为 -1
+        seg_map = -torch.ones(image.shape[:2], dtype=torch.int32).cuda() # 创建一个与图像尺寸相同的二维数组 seg_map，并初始化为 -1
         for i in range(len(masks)):
             mask = masks[i]
             seg_img = get_seg_img(mask, image)
             pad_seg_img = cv2.resize(pad_img(seg_img), (224,224))   # 通过先 pad 成正方形，不拉伸变形原图比例
             seg_img_list.append(pad_seg_img)
 
-            seg_map[masks[i]['segmentation']] = i   # 将第 i 个目标的分割区域在 seg_map 中赋值为 i，从而在 seg_map 中标注每个目标的“编号”或“ID”
+            seg_map[torch.from_numpy(masks[i]['segmentation']).cuda()] = i   # 将第 i 个目标的分割区域在 seg_map 中赋值为 i，从而在 seg_map 中标注每个目标的“编号”或“ID”
         seg_imgs = np.stack(seg_img_list, axis=0) # b,224,224,3
         # 在这里实现 [0， 255] -> [0.0, 1.0]
         seg_imgs = (torch.from_numpy(seg_imgs.astype("float32")).permute(0,3,1,2) / 255.0).to('cuda')   # b,224,224,3 -> b,3,224,224    归一化到[0.0, 1.0]
