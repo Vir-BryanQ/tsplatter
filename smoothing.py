@@ -1,3 +1,9 @@
+import os
+os.environ["MKL_NUM_THREADS"] = "12"
+os.environ["NUMEXPR_NUM_THREADS"] = "12"
+os.environ["OMP_NUM_THREADS"] = "12"
+import shutil
+
 def update_voting_mat(result_dict, language_feature_mask, gt_language_feature, contribution, ids, args):
     # Select only locations where Mask is True
     mask_idx = language_feature_mask.squeeze(0).nonzero(as_tuple=True)
@@ -276,13 +282,18 @@ def compute_significant_mask(viewpoint_stack, gaussians, pipe, background, max_t
 
     return significant_mask
 
-def laplacian_smoothing(gaussians, cluster_ids, full_significant_mask, lambda_reg=1e-3, k_neighbors=10000, max_group_size=55000):
+def laplacian_smoothing(gaussians, cluster_ids, full_significant_mask, local_sh, lambda_reg=1e-3, k_neighbors=10000, max_group_size=55000, pow_k=2):
     t0 = time.perf_counter()
 
     N = gaussians.get_thermal_features.shape[0]
     device = gaussians.get_thermal_features.device
     # thermal_features = gaussians.get_thermal_features.clone()   # [N,K,3]
-    colors = rgb_to_lab(torch.sigmoid(gaussians._thermal_features_dc))   # [N,3]
+    if local_sh:
+        colors = gaussians.get_thermal_features.clone() # [N,K,3]
+        K = colors.shape[1]
+        colors = colors.reshape(N, -1)  # [N,K*3]
+    else:
+        colors = rgb_to_lab(torch.sigmoid(gaussians._thermal_features_dc))   # [N,3]
 
     unique_cluster_ids = torch.unique(cluster_ids)
     retain_mask = torch.ones(N, device=device, dtype=torch.bool)
@@ -293,6 +304,7 @@ def laplacian_smoothing(gaussians, cluster_ids, full_significant_mask, lambda_re
         indices_list = torch.split(all_indices, max_group_size)
         if all_indices.shape[0] > max_group_size:
             print(f"Split large group {cluster_id} into {len(indices_list)} groups: {all_indices.shape[0]} > {max_group_size}")
+            sys.exit(-1)
 
         # colors[indices] = generate_lab_colors(indices.shape[0], indices.device)
         # continue
@@ -300,7 +312,7 @@ def laplacian_smoothing(gaussians, cluster_ids, full_significant_mask, lambda_re
         for indices in indices_list:
             significant_mask = full_significant_mask[indices]    # [M]
 
-            known_colors = colors[indices[significant_mask]]  # [M1,3]
+            known_colors = colors[indices[significant_mask]]  # [M1,K*3]
             M1 = known_colors.shape[0]
             if M1 == 0:
                 # retain_mask[indices] = False
@@ -315,7 +327,7 @@ def laplacian_smoothing(gaussians, cluster_ids, full_significant_mask, lambda_re
             euclidean_dists = torch.cdist(means, means)   # [M,M]
             knn_idx = euclidean_dists.topk(k + 1, largest=False).indices   # [M,k+1]
             # weights = 1 / (euclidean_dists + 1e-9)  # [M,M]  
-            weights = euclidean_dists.pow_(2).add_(1e-9).reciprocal_() # [M,M] 
+            weights = euclidean_dists.pow_(pow_k).add_(1e-9).reciprocal_() # [M,M] 
             del euclidean_dists     # 引用没有清空前不会释放显存
 
             graph_mask = torch.zeros((M, M), device=device, dtype=torch.bool)     # [M,M]
@@ -336,13 +348,13 @@ def laplacian_smoothing(gaussians, cluster_ids, full_significant_mask, lambda_re
             L_ij = laplacian_matrix[non_significant_mask, :][:, significant_mask]  # [M2,M1]
             del laplacian_matrix
 
-            rhs = -torch.mm(L_ij, known_colors)  # [M2,3]
+            rhs = -torch.mm(L_ij, known_colors)  # [M2,K*3]
             del L_ij
             lhs = L_ii + lambda_reg * torch.eye(L_ii.shape[0], device=device)   # [M2,M2]
             del L_ii
 
             try:
-                smooth_unknown_colors = torch.linalg.solve(lhs, rhs)    # [M2,3]
+                smooth_unknown_colors = torch.linalg.solve(lhs, rhs)    # [M2,K*3]
             except torch.linalg.LinAlgError:
                 # 病态矩阵
                 # print('Warning: the input matrix is singular')
@@ -377,22 +389,26 @@ def laplacian_smoothing(gaussians, cluster_ids, full_significant_mask, lambda_re
         # gc.collect()
 
         # thermal_features[indices][non_significant_mask] = smooth_unknown_features
+    if local_sh:
+        colors = colors.reshape(N, K, 3)
+    else:
+        colors = torch.logit(lab_to_rgb(colors), eps=1e-10)
     
     t1 = time.perf_counter()
     print(f"laplacian_smoothing: {(t1 - t0) * 1000:.3f} ms")
 
     # return thermal_features
-    return  torch.logit(lab_to_rgb(colors), eps=1e-10), retain_mask  # [N,3]
+    return colors, retain_mask  # [N,3]
 
 def temperature_propagation(gaussians, scene, pipe, background, dataset, args):
     t0 = time.perf_counter()
 
     viewpoint_stack = scene.getTestCameras().copy()
     print(f'Use {len(viewpoint_stack)} images for significant mask computation')
-    cluster_ids = cosine_similarity_clustering(gaussians.get_language_feature)
-    significant_mask = compute_significant_mask(viewpoint_stack, gaussians, pipe, background)
+    cluster_ids = cosine_similarity_clustering(gaussians.get_language_feature, threshold=args.clustering_threshold)
+    significant_mask = compute_significant_mask(viewpoint_stack, gaussians, pipe, background, max_threshold=args.max_threshold, use_max_weight=args.use_max_weight, sum_threshold=args.sum_threshold)
     # thermal_features = laplacian_smoothing(gaussians, cluster_ids, significant_mask)
-    thermal_colors, retain_mask = laplacian_smoothing(gaussians, cluster_ids, significant_mask)
+    thermal_colors, retain_mask = laplacian_smoothing(gaussians, cluster_ids, significant_mask, args.local_sh, k_neighbors=args.k_neighbors, lambda_reg=args.lambda_reg, pow_k=args.pow_k)
 
     t1 = time.perf_counter()
     print(f"temperature_propagation: {(t1 - t0) * 1000:.3f} ms")
@@ -453,7 +469,12 @@ def smoothing(dataset, opt, pipe, checkpoint, args):
     # thermal_features = temperature_propagation(gaussians, scene, pipe, background, dataset, args)
     # gaussians._thermal_features_dc = thermal_features[:, 0, :]
     # gaussians._thermal_features_rest = thermal_features[:, 1:, :]
-    gaussians._thermal_features_dc, retain_mask = temperature_propagation(gaussians, scene, pipe, background, dataset, args)
+    thermal_colors, retain_mask = temperature_propagation(gaussians, scene, pipe, background, dataset, args)
+    if args.local_sh:
+        gaussians._thermal_features_dc = thermal_colors[:, 0]
+        gaussians._thermal_features_rest = thermal_colors[:, 1:]
+    else:
+        gaussians._thermal_features_dc = thermal_colors
 
     gaussians_mask = gaussians_mask.cpu()
     retain_mask = retain_mask.cpu()
@@ -496,21 +517,25 @@ def smoothing(dataset, opt, pipe, checkpoint, args):
     #     new_checkpoint = base_name + "_smooth" + ext
     #     torch.save(ckpt, new_checkpoint)
 
-def move_checkpoint_file(args):
-    # 检查文件是否存在
-    if os.path.exists(args.start_checkpoint):
-        print(f"File {args.start_checkpoint} exists. Deleting it.")
-        os.remove(args.start_checkpoint)  # 删除文件
+def move_checkpoint_file(args, origin_dir_name):
 
-    # 获取 args.start_checkpoint 所在目录的父目录
     parent_dir = os.path.dirname(os.path.abspath(args.start_checkpoint))
     checkpoint_name = os.path.basename(os.path.abspath(args.start_checkpoint))
-    origin_checkpoint_path = os.path.join(os.path.dirname(parent_dir), 'origin', checkpoint_name)
+    origin_dir_path = os.path.join(os.path.dirname(parent_dir), origin_dir_name)
+    origin_checkpoint_path = os.path.join(origin_dir_path, checkpoint_name)
 
-    # 检查 origin/step-000000299.ckpt 是否存在
+    if not os.path.exists(origin_dir_path):
+        print(f"Directory {origin_dir_path} doesn't exists. Creating it.")
+        os.makedirs(origin_dir_path, exist_ok=False)
+        shutil.copy2(args.start_checkpoint, origin_dir_path)
+
+    if os.path.exists(args.start_checkpoint):
+        print(f"File {args.start_checkpoint} exists. Deleting it.")
+        os.remove(args.start_checkpoint)  
+
     if os.path.exists(origin_checkpoint_path):
         print(f"Copying {origin_checkpoint_path} to {parent_dir}")
-        shutil.copy2(origin_checkpoint_path, args.start_checkpoint)  # 复制文件
+        shutil.copy2(origin_checkpoint_path, args.start_checkpoint)  
     else:
         print(f"File {origin_checkpoint_path} does not exist.")
         sys.exit(-1)
@@ -545,6 +570,15 @@ if __name__ == "__main__":
     parser.add_argument('--encoder', type=str, default="dino")
     parser.add_argument('--train_list_file', type=str, default=None)
     parser.add_argument('--vram', type=int, required=False, default=32)
+    parser.add_argument("--local_sh", action="store_true")
+
+    parser.add_argument("--clustering_threshold", type=float, default = 0.83)
+    parser.add_argument("--use_max_weight", action="store_true")
+    parser.add_argument("--max_threshold", type=float, default = 0.1)
+    parser.add_argument("--sum_threshold", type=float, default = 3)
+    parser.add_argument('--k_neighbors', type=int, default=10000)
+    parser.add_argument("--lambda_reg", type=float, default = 1e-3)
+    parser.add_argument("--pow_k", type=float, default = 2)
     
     # parser.add_argument("--use_pq", action="store_true")
     # parser.add_argument("--pq_index", type=str, default=None)
@@ -574,10 +608,6 @@ if __name__ == "__main__":
     #         raise ValueError("PQ index file is not provided.")
     #     lp._language_features_name = "language_features_pq"
 
-    import os
-    os.environ["MKL_NUM_THREADS"] = "12"
-    os.environ["NUMEXPR_NUM_THREADS"] = "12"
-    os.environ["OMP_NUM_THREADS"] = "12"
     import time
     from torch_scatter import scatter_max
     import torch.nn.functional as F
@@ -589,7 +619,6 @@ if __name__ == "__main__":
     from tqdm import tqdm
     import numpy as np
     import matplotlib.pyplot as plt
-    import shutil
     from tsplatter.utils.color_utils import rgb_to_lab, lab_to_rgb
 
     if args.encoder not in ['dino', 'clip']:
@@ -599,7 +628,7 @@ if __name__ == "__main__":
     safe_state(args.quiet)
     torch.set_grad_enabled(False)
 
-    move_checkpoint_file(args)
+    move_checkpoint_file(args, 'origin')
 
     # 在 PyTorch 中，autograd 会记录运算过程并自动求导。有时候在反向传播（loss.backward()）时，会遇到 NaN、inf 或非法操作，但报错信息并不会直接告诉你是在哪个算子里出的问题，调试起来很麻烦
     # 调用 torch.autograd.set_detect_anomaly(True) 后，PyTorch 会在反向传播时逐步检查每个算子 的梯度计算，一旦发现 NaN 或 inf，就会立刻报错，并指出具体是在哪个算子里出现的异常

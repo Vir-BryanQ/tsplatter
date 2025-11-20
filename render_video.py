@@ -180,6 +180,11 @@ def render_images(gaussians, viewmats, Ks, W, H):
     else:
         colors = torch.sigmoid(gaussians.get_thermal_features).squeeze(-2)
 
+    if args.local_sh:
+        vanilla_sh = False
+        colors = gaussians.get_thermal_features
+        sh_degree = gaussians._thermal_features_rest.shape[1]
+
     render, alpha, _ = rasterization_thermal(
             means=gaussians._xyz,
             quats=gaussians._rotation,   # 实际上不归一化也是可以的
@@ -221,6 +226,7 @@ if __name__ == "__main__":
     parser.add_argument("--start_checkpoint", type=str, default=None)
     parser.add_argument("--shuffle", action="store_true")
     parser.add_argument('--width', type=int, required=False, default=640, help="Image width")
+    parser.add_argument("--local_sh", action="store_true")
     args = parser.parse_args(sys.argv[1:])
 
     main(args)

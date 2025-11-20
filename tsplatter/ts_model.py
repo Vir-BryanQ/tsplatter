@@ -149,13 +149,13 @@ def get_scale_loss(scales):
 class TSplatterModelConfig(SplatfactoModelConfig):
     _target: Type = field(default_factory=lambda: TSplatterModel)
     # warmup_length: int = 500
-    warmup_length: int = 10
+    warmup_length: int = 50
     """period of steps where refinement is turned off"""
     # refine_every: int = 100
-    refine_every: int = 10
+    refine_every: int = 50
     """period of steps where gaussians are culled and densified"""
     # resolution_schedule: int = 3000
-    resolution_schedule: int = 150
+    resolution_schedule: int = 300
     """training starts at 1/d resolution, every n steps this is doubled"""
     background_color: Literal["random", "black", "white"] = "random"
     """Whether to randomize the background color."""
@@ -194,10 +194,10 @@ class TSplatterModelConfig(SplatfactoModelConfig):
     ssim_lambda: float = 0.2
     """weight of ssim loss"""
     # stop_split_at: int = 15000
-    stop_split_at: int = 150
+    stop_split_at: int = 1350
     """stop splitting at this step"""
     # sh_degree: int = 4
-    sh_degree: int = 0
+    sh_degree: int = 4
     """maximum degree of spherical harmonics to use"""
     use_scale_regularization: bool = False
     """If enabled, a scale regularization introduced in PhysGauss (https://xpandora.github.io/PhysGaussian/) is used for reducing huge spikey gaussians."""
@@ -235,6 +235,7 @@ class TSplatterModelConfig(SplatfactoModelConfig):
     use_vanilla_sh: bool = False
     use_merge_sparsification: bool = False # disable_refinement should be False
     stop_merge_at: int = 150
+    thermal_init: bool = False
 
 class TSplatterModel(SplatfactoModel):
     config: TSplatterModelConfig
@@ -350,11 +351,14 @@ class TSplatterModel(SplatfactoModel):
         thermal_colors = assign_thermal_colors(means=means, thermal_images=thermal_images, world_points=world_points, k=3)
 
         shs = torch.zeros((means.shape[0], dim_sh, 3)).float().cuda()
-        if self.config.sh_degree > 0:
-            shs[:, 0, :3] = RGB2SH(thermal_colors)
+        if self.config.thermal_init:
+            if self.config.sh_degree > 0:
+                shs[:, 0, :3] = RGB2SH(thermal_colors)
+            else:
+                CONSOLE.log("use color only optimization with sigmoid activation")
+                shs[:, 0, :3] = torch.logit(thermal_colors, eps=1e-10)
         else:
-            CONSOLE.log("use color only optimization with sigmoid activation")
-            shs[:, 0, :3] = torch.logit(thermal_colors, eps=1e-10)
+            CONSOLE.log("NO THERMAL INITIALIZATION")
 
         thermal_features_dc = torch.nn.Parameter(shs[:, 0, :]) 
         thermal_features_rest = torch.nn.Parameter(shs[:, 1:, :])
@@ -425,7 +429,8 @@ class TSplatterModel(SplatfactoModel):
             # 和 PyTorch 优化器（如 torch.optim.Adam(params: Iterable[Tensor], ...)）兼容接口
             # 优化器期望传入参数是 可迭代的对象（如列表），即便只优化一个参数，也得放在 [param] 里
             name: [self.gauss_params[name]]
-            for name in ["means", "scales", "quats", "thermal_features_dc", "thermal_features_rest", "opacities"]
+            # for name in ["means", "scales", "quats", "thermal_features_dc", "thermal_features_rest", "opacities"]
+            for name in ["thermal_features_dc", "thermal_features_rest"]
         }
 
     # 获取优化器的参数组
